@@ -4,7 +4,7 @@ import { Label } from "@/components/ui/label";
 import { InputWithContext } from "@/components/ui/input-with-context";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue, } from "@/components/ui/select";
-import { FolderOpen, RefreshCw, FileMusic, ChevronRight, ChevronDown, Pencil, Eye, Folder, Info, RotateCcw, FileText, Image, Copy, Check, } from "lucide-react";
+import { FolderOpen, RefreshCw, FileMusic, ChevronRight, ChevronDown, Pencil, Eye, Folder, Info, RotateCcw, FileText, Image, Copy, Check, TrendingUp, Download, } from "lucide-react";
 import { Tooltip, TooltipTrigger, TooltipContent } from "@/components/ui/tooltip";
 import { Spinner } from "@/components/ui/spinner";
 import { Badge } from "@/components/ui/badge";
@@ -12,6 +12,7 @@ import { SelectFolder } from "../../wailsjs/go/main/App";
 import { backend } from "../../wailsjs/go/models";
 import { toastWithSound as toast } from "@/lib/toast-with-sound";
 import { getSettings } from "@/lib/settings";
+import { useDownload } from "@/hooks/useDownload";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, } from "@/components/ui/dialog";
 const ListDirectoryFiles = (path: string): Promise<backend.FileInfo[]> => (window as any)['go']['main']['App']['ListDirectoryFiles'](path);
 const PreviewRenameFiles = (files: string[], format: string): Promise<backend.RenamePreview[]> => (window as any)['go']['main']['App']['PreviewRenameFiles'](files, format);
@@ -26,6 +27,7 @@ const DownloadFFmpeg = (): Promise<{
 const ReadTextFile = (path: string): Promise<string> => (window as any)['go']['main']['App']['ReadTextFile'](path);
 const RenameFileTo = (oldPath: string, newName: string): Promise<void> => (window as any)['go']['main']['App']['RenameFileTo'](oldPath, newName);
 const ReadImageAsBase64 = (path: string): Promise<string> => (window as any)['go']['main']['App']['ReadImageAsBase64'](path);
+const ScanSingleFileForQualityUpgrade = (filePath: string): Promise<string> => (window as any)['go']['main']['App']['ScanSingleFileForQualityUpgrade']({ file_path: filePath });
 interface FileNode {
     name: string;
     path: string;
@@ -43,7 +45,36 @@ interface FileMetadata {
     disc_number: number;
     year: string;
 }
-type TabType = "track" | "lyric" | "cover";
+interface QualityUpgradeSuggestion {
+    file_path: string;
+    file_name: string;
+    file_size: number;
+    current_format: string;
+    metadata?: FileMetadata;
+    spotify_id?: string;
+    spotify_track?: {
+        id: string;
+        name: string;
+        artists: string;
+        album_name: string;
+        images: string;
+        external_url: string;
+        duration_ms: number;
+    };
+    availability?: {
+        spotify_id: string;
+        tidal: boolean;
+        amazon: boolean;
+        qobuz: boolean;
+        tidal_url?: string;
+        amazon_url?: string;
+        qobuz_url?: string;
+    };
+    error?: string;
+    search_query?: string;
+    match_confidence?: string;
+}
+type TabType = "track" | "lyric" | "cover" | "quality-upgrade";
 const FORMAT_PRESETS: Record<string, {
     label: string;
     template: string;
@@ -132,6 +163,9 @@ export function FileManagerPage() {
     const [manualRenameFile, setManualRenameFile] = useState("");
     const [manualRenameName, setManualRenameName] = useState("");
     const [manualRenaming, setManualRenaming] = useState(false);
+    const [qualityUpgradeSuggestions, setQualityUpgradeSuggestions] = useState<Map<string, QualityUpgradeSuggestion>>(new Map());
+    const [scanningFiles, setScanningFiles] = useState<Set<string>>(new Set());
+    const download = useDownload();
     useEffect(() => {
         try {
             localStorage.setItem(STORAGE_KEY, JSON.stringify({ formatPreset, customFormat }));
@@ -273,6 +307,43 @@ export function FileManagerPage() {
     };
     const selectAll = () => setSelectedFiles(new Set(allAudioFiles.map((f) => f.path)));
     const deselectAll = () => setSelectedFiles(new Set());
+    const handleScanSingleFile = async (filePath: string) => {
+        if (scanningFiles.has(filePath)) {
+            return;
+        }
+        setScanningFiles((prev) => new Set(prev).add(filePath));
+        try {
+            const jsonString = await ScanSingleFileForQualityUpgrade(filePath);
+            const suggestion: QualityUpgradeSuggestion = JSON.parse(jsonString);
+            setQualityUpgradeSuggestions((prev) => {
+                const newMap = new Map(prev);
+                newMap.set(filePath, suggestion);
+                return newMap;
+            });
+            if (suggestion.error) {
+                toast.error("No upgrade found", { description: suggestion.error });
+            }
+            else if (suggestion.spotify_id) {
+                const hasAvailability = suggestion.availability && (suggestion.availability.tidal || suggestion.availability.amazon || suggestion.availability.qobuz);
+                if (hasAvailability) {
+                    toast.success("Upgrade available!", { description: `Found on ${suggestion.availability?.tidal ? "Tidal" : ""}${suggestion.availability?.amazon ? (suggestion.availability?.tidal ? ", Amazon" : "Amazon") : ""}${suggestion.availability?.qobuz ? (suggestion.availability?.tidal || suggestion.availability?.amazon ? ", Qobuz" : "Qobuz") : ""}` });
+                }
+                else {
+                    toast.info("Track found", { description: "No high-quality sources available" });
+                }
+            }
+        }
+        catch (err) {
+            toast.error("Failed to scan file", { description: err instanceof Error ? err.message : "Unknown error" });
+        }
+        finally {
+            setScanningFiles((prev) => {
+                const newSet = new Set(prev);
+                newSet.delete(filePath);
+                return newSet;
+            });
+        }
+    };
     const resetToDefault = () => { setFormatPreset(DEFAULT_PRESET); setCustomFormat(DEFAULT_CUSTOM_FORMAT); setShowResetConfirm(false); };
     const handlePreview = async (isPreviewOnly: boolean) => {
         if (selectedFiles.size === 0) {
@@ -520,6 +591,78 @@ export function FileManagerPage() {
         {node.is_dir && node.expanded && node.children && <div>{renderLyricTree(node.children, depth + 1)}</div>}
       </div>));
     };
+    const renderQualityUpgradeFiles = (files: FileNode[]) => {
+        return (<div className="space-y-2">
+            {files.map((file) => {
+                const suggestion = qualityUpgradeSuggestions.get(file.path);
+                const isScanning = scanningFiles.has(file.path);
+                const hasAvailability = suggestion?.availability && (suggestion.availability.tidal || suggestion.availability.amazon || suggestion.availability.qobuz);
+                const confidenceColor = suggestion?.match_confidence === "high" ? "bg-green-500/10 text-green-600 border-green-500/20" : suggestion?.match_confidence === "medium" ? "bg-yellow-500/10 text-yellow-600 border-yellow-500/20" : suggestion?.match_confidence === "low" ? "bg-orange-500/10 text-orange-600 border-orange-500/20" : "";
+                return (<div key={file.path} className={`p-3 rounded-lg border ${suggestion?.error ? "border-destructive/50 bg-destructive/5" : suggestion ? "border-border" : "border-border/50"}`}>
+                    <div className="flex items-start justify-between gap-4">
+                        <div className="flex-1 min-w-0">
+                            <div className="flex items-center gap-2 mb-2">
+                                <FileMusic className="h-4 w-4 text-primary shrink-0"/>
+                                <span className="font-medium text-sm truncate">{file.name}</span>
+                                <Badge variant="outline" className="text-xs shrink-0">{file.name.split('.').pop()?.toUpperCase() || "UNKNOWN"}</Badge>
+                                {suggestion?.match_confidence && (<Badge className={`text-xs shrink-0 ${confidenceColor}`}>{suggestion.match_confidence} match</Badge>)}
+                            </div>
+                            {suggestion?.metadata && (<div className="text-sm text-muted-foreground mb-2">
+                                <div><span className="font-medium">Title:</span> {suggestion.metadata.title || "-"}</div>
+                                <div><span className="font-medium">Artist:</span> {suggestion.metadata.artist || "-"}</div>
+                                {suggestion.metadata.album && <div><span className="font-medium">Album:</span> {suggestion.metadata.album}</div>}
+                            </div>)}
+                            {suggestion?.spotify_track && (<div className="text-sm mb-2">
+                                <div className="text-muted-foreground">Spotify Match:</div>
+                                <div className="font-medium">{suggestion.spotify_track.name}</div>
+                                <div className="text-muted-foreground">{suggestion.spotify_track.artists}</div>
+                            </div>)}
+                            {suggestion?.availability && hasAvailability && (<div className="flex items-center gap-2 mt-2">
+                                <span className="text-xs text-muted-foreground">Available on:</span>
+                                {suggestion.availability.tidal && <Badge variant="secondary" className="text-xs">Tidal</Badge>}
+                                {suggestion.availability.amazon && <Badge variant="secondary" className="text-xs">Amazon</Badge>}
+                                {suggestion.availability.qobuz && <Badge variant="secondary" className="text-xs">Qobuz</Badge>}
+                            </div>)}
+                            {suggestion?.error && !isScanning && (<div className="text-sm text-destructive mt-2">{suggestion.error}</div>)}
+                        </div>
+                        <div className="flex flex-col gap-2 shrink-0">
+                            {!suggestion && (<Button size="sm" variant="outline" onClick={() => handleScanSingleFile(file.path)} disabled={isScanning}>
+                                {isScanning ? <><Spinner className="h-4 w-4"/>Searching...</> : <><TrendingUp className="h-4 w-4"/>Find Upgrade</>}
+                            </Button>)}
+                            {suggestion?.spotify_id && hasAvailability && (<Button size="sm" variant="outline" onClick={async () => {
+                                if (suggestion.spotify_id && suggestion.spotify_track) {
+                                    const trackName = suggestion.spotify_track.name || suggestion.metadata?.title || "";
+                                    const artistName = suggestion.spotify_track.artists || suggestion.metadata?.artist || "";
+                                    const albumName = suggestion.spotify_track.album_name || suggestion.metadata?.album || "";
+                                    const durationMs = suggestion.spotify_track.duration_ms || 0;
+                                    const coverUrl = suggestion.spotify_track.images || "";
+                                    
+                                    await download.handleDownloadTrack(
+                                        suggestion.spotify_id,
+                                        trackName,
+                                        artistName,
+                                        albumName,
+                                        suggestion.spotify_id,
+                                        undefined,
+                                        durationMs,
+                                        undefined,
+                                        undefined,
+                                        undefined,
+                                        coverUrl
+                                    );
+                                }
+                            }} disabled={download.isDownloading}>
+                                {download.isDownloading ? <><Spinner className="h-4 w-4"/>Downloading...</> : <><Download className="h-4 w-4"/>Download</>}
+                            </Button>)}
+                            {suggestion && !hasAvailability && !suggestion.error && (<Button size="sm" variant="ghost" onClick={() => handleScanSingleFile(file.path)} disabled={isScanning}>
+                                {isScanning ? <><Spinner className="h-4 w-4"/>Searching...</> : <><RefreshCw className="h-4 w-4"/>Refresh</>}
+                            </Button>)}
+                        </div>
+                    </div>
+                </div>);
+            })}
+        </div>);
+    };
     const renderCoverTree = (nodes: FileNode[], depth = 0) => {
         return nodes.map((node) => (<div key={node.path}>
         <div className="flex items-center gap-2 py-1.5 px-2 rounded hover:bg-muted/50 cursor-pointer" style={{ paddingLeft: `${depth * 16 + 8}px` }} onClick={(e) => node.is_dir ? toggleExpand(node.path) : handleShowCover(node.path, e)}>
@@ -579,6 +722,10 @@ export function FileManagerPage() {
           <Image className="h-4 w-4"/>
           Cover ({allCoverFiles.length})
         </Button>
+        <Button variant={activeTab === "quality-upgrade" ? "default" : "ghost"} size="sm" onClick={() => setActiveTab("quality-upgrade")} className="rounded-b-none">
+          <TrendingUp className="h-4 w-4"/>
+          Quality Upgrade
+        </Button>
       </div>
 
       
@@ -636,13 +783,33 @@ export function FileManagerPage() {
               </Button>
             </div>
           </div>)}
+        {activeTab === "quality-upgrade" && (<div className="flex items-center justify-between p-3 border-b bg-muted/30 shrink-0">
+            <div className="flex items-center gap-4">
+              <span className="text-sm text-muted-foreground">{allAudioFiles.length} audio file(s) found</span>
+              {qualityUpgradeSuggestions.size > 0 && (<span className="text-sm text-muted-foreground">• {qualityUpgradeSuggestions.size} suggestion(s)</span>)}
+            </div>
+          </div>)}
 
         <div className={`overflow-y-auto p-2 ${isFullscreen ? "flex-1 min-h-0" : "max-h-[400px]"}`}>
-          {loading ? (<div className="flex items-center justify-center py-8"><Spinner className="h-6 w-6"/></div>) : filteredFiles.length === 0 ? (<div className="text-center py-8 text-muted-foreground">
+          {loading ? (
+            <div className="flex items-center justify-center py-8"><Spinner className="h-6 w-6"/></div>
+          ) : activeTab === "quality-upgrade" ? (
+            allAudioFiles.length === 0 ? (
+              <div className="text-center py-8 text-muted-foreground">
+                {rootPath ? "No audio files found in this folder" : "Select a folder to browse"}
+              </div>
+            ) : (
+              renderQualityUpgradeFiles(allAudioFiles)
+            )
+          ) : filteredFiles.length === 0 ? (
+            <div className="text-center py-8 text-muted-foreground">
               {rootPath ? `No ${activeTab} files found` : "Select a folder to browse"}
-            </div>) : (activeTab === "track" ? renderTrackTree(filteredFiles) :
+            </div>
+          ) : (
+            activeTab === "track" ? renderTrackTree(filteredFiles) :
             activeTab === "lyric" ? renderLyricTree(filteredFiles) :
-                renderCoverTree(filteredFiles))}
+            renderCoverTree(filteredFiles)
+          )}
         </div>
       </div>
 

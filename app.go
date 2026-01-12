@@ -1049,3 +1049,53 @@ func (a *App) CheckFilesExistence(outputDir string, tracks []CheckFileExistenceR
 func (a *App) SkipDownloadItem(itemID, filePath string) {
 	backend.SkipDownloadItem(itemID, filePath)
 }
+
+type ScanFolderRequest struct {
+	FolderPath string `json:"folder_path"`
+}
+
+func (a *App) ScanFolderForQualityUpgrades(req ScanFolderRequest) (string, error) {
+	if req.FolderPath == "" {
+		return "", fmt.Errorf("folder path is required")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	suggestions, err := backend.ScanFolderForQualityUpgrades(ctx, req.FolderPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to scan folder: %v", err)
+	}
+
+	jsonData, err := json.Marshal(suggestions)
+	if err != nil {
+		return "", fmt.Errorf("failed to encode response: %v", err)
+	}
+
+	return string(jsonData), nil
+}
+
+type ScanSingleFileRequest struct {
+	FilePath string `json:"file_path"`
+}
+
+func (a *App) ScanSingleFileForQualityUpgrade(req ScanSingleFileRequest) (string, error) {
+	if req.FilePath == "" {
+		return "", fmt.Errorf("file path is required")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	suggestion, err := backend.ScanSingleFileForQualityUpgrade(ctx, req.FilePath)
+	if err != nil {
+		return "", fmt.Errorf("failed to scan file: %v", err)
+	}
+
+	jsonData, err := json.Marshal(suggestion)
+	if err != nil {
+		return "", fmt.Errorf("failed to encode response: %v", err)
+	}
+
+	return string(jsonData), nil
+}
