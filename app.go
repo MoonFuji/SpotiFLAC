@@ -5,8 +5,11 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"spotiflac/backend"
 	"strings"
 	"time"
@@ -1098,4 +1101,181 @@ func (a *App) ScanSingleFileForQualityUpgrade(req ScanSingleFileRequest) (string
 	}
 
 	return string(jsonData), nil
+}
+
+func (a *App) ReadAudioFileAsBase64(filePath string) (string, error) {
+	if filePath == "" {
+		return "", fmt.Errorf("file path is required")
+	}
+
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		return "", fmt.Errorf("failed to read audio file: %v", err)
+	}
+
+	// Determine MIME type based on extension
+	ext := strings.ToLower(filepath.Ext(filePath))
+	mimeType := "audio/mpeg"
+	switch ext {
+	case ".mp3":
+		mimeType = "audio/mpeg"
+	case ".flac":
+		mimeType = "audio/flac"
+	case ".m4a", ".aac":
+		mimeType = "audio/mp4"
+	case ".ogg":
+		mimeType = "audio/ogg"
+	case ".wav":
+		mimeType = "audio/wav"
+	case ".opus":
+		mimeType = "audio/opus"
+	}
+
+	encoded := base64.StdEncoding.EncodeToString(data)
+	return fmt.Sprintf("data:%s;base64,%s", mimeType, encoded), nil
+}
+
+func (a *App) FindDuplicateTracks(folderPath string) (string, error) {
+	if folderPath == "" {
+		return "", fmt.Errorf("folder path is required")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	duplicates, err := backend.FindDuplicateTracks(ctx, folderPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to find duplicates: %v", err)
+	}
+
+	jsonData, err := json.Marshal(duplicates)
+	if err != nil {
+		return "", fmt.Errorf("failed to encode response: %v", err)
+	}
+
+	return string(jsonData), nil
+}
+
+func (a *App) OpenFileLocation(filePath string) error {
+	if filePath == "" {
+		return fmt.Errorf("file path is required")
+	}
+
+	log.Printf("[OpenFileLocation] Opening file location for: %s", filePath)
+
+	// Verify file exists
+	if _, err := os.Stat(filePath); os.IsNotExist(err) {
+		log.Printf("[OpenFileLocation] ERROR: File does not exist: %s", filePath)
+		return fmt.Errorf("file does not exist: %s", filePath)
+	}
+
+	// Get the directory containing the file
+	dir := filepath.Dir(filePath)
+	fileName := filepath.Base(filePath)
+
+	log.Printf("[OpenFileLocation] Directory: %s, File: %s", dir, fileName)
+
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "linux":
+		// Try to detect and use the appropriate file manager with file selection
+		desktop := os.Getenv("XDG_CURRENT_DESKTOP")
+		desktopSession := os.Getenv("DESKTOP_SESSION")
+		log.Printf("[OpenFileLocation] XDG_CURRENT_DESKTOP: %s", desktop)
+		log.Printf("[OpenFileLocation] DESKTOP_SESSION: %s", desktopSession)
+
+		// Try file manager-specific commands that support file selection
+		// Different file managers have different syntax for selecting files
+		fileManagers := []struct {
+			name    string
+			command string
+			args    []string
+		}{
+			// Nautilus (GNOME Files) - uses --select with full file path
+			{"nautilus", "nautilus", []string{"--select", filePath}},
+			// Dolphin (KDE) - uses --select with full file path
+			{"dolphin", "dolphin", []string{"--select", filePath}},
+			// Thunar (XFCE) - uses --select with full file path
+			{"thunar", "thunar", []string{"--select", filePath}},
+			// PCManFM (LXDE) - uses --select with full file path
+			{"pcmanfm", "pcmanfm", []string{"--select", filePath}},
+			// Caja (MATE) - uses --select with full file path
+			{"caja", "caja", []string{"--select", filePath}},
+			// Nemo (Cinnamon) - uses --select with full file path
+			{"nemo", "nemo", []string{"--select", filePath}},
+			// Some file managers might need directory + file separately
+			// Try with directory first, then file selection
+			{"nautilus-alt", "nautilus", []string{dir, "--select", fileName}},
+		}
+
+		// Try file manager-specific commands first
+		for _, fm := range fileManagers {
+			if path, err := exec.LookPath(fm.command); err == nil {
+				log.Printf("[OpenFileLocation] Found file manager: %s at %s", fm.name, path)
+				log.Printf("[OpenFileLocation] Trying command: %s %v", fm.command, fm.args)
+				testCmd := exec.Command(fm.command, fm.args...)
+				if err := testCmd.Start(); err == nil {
+					log.Printf("[OpenFileLocation] Successfully opened with %s", fm.name)
+					// Don't wait for the command to finish, just start it
+					go func() {
+						_ = testCmd.Wait()
+					}()
+					return nil
+				}
+				log.Printf("[OpenFileLocation] Failed to start %s: %v", fm.name, err)
+			} else {
+				log.Printf("[OpenFileLocation] File manager %s not found: %v", fm.name, err)
+			}
+		}
+
+		// Fallback: Try using dbus-send for some desktop environments
+		// This can work with GNOME/KDE file managers
+		log.Printf("[OpenFileLocation] Trying dbus-send method")
+		if _, err := exec.LookPath("dbus-send"); err == nil {
+			dbusCmd := exec.Command("dbus-send", "--session", "--type=method_call",
+				"--dest=org.freedesktop.FileManager1",
+				"/org/freedesktop/FileManager1",
+				"org.freedesktop.FileManager1.ShowItems",
+				fmt.Sprintf("array:string:file://%s", filePath),
+				"string:")
+			if err := dbusCmd.Start(); err == nil {
+				log.Printf("[OpenFileLocation] Successfully opened with dbus-send")
+				go func() {
+					_ = dbusCmd.Wait()
+				}()
+				return nil
+			}
+			log.Printf("[OpenFileLocation] dbus-send failed: %v", err)
+		} else {
+			log.Printf("[OpenFileLocation] dbus-send not found")
+		}
+
+		// Last resort: open directory (at least gets user to the right place)
+		log.Printf("[OpenFileLocation] Fallback: opening directory with xdg-open")
+		log.Printf("[OpenFileLocation] WARNING: File selection may not work, opening directory instead")
+		cmd = exec.Command("xdg-open", dir)
+	case "darwin":
+		log.Printf("[OpenFileLocation] Using macOS 'open -R' command")
+		cmd = exec.Command("open", "-R", filePath)
+	case "windows":
+		log.Printf("[OpenFileLocation] Using Windows explorer /select command")
+		cmd = exec.Command("explorer", "/select,", filePath)
+	default:
+		log.Printf("[OpenFileLocation] ERROR: Unsupported OS: %s", runtime.GOOS)
+		return fmt.Errorf("unsupported operating system: %s", runtime.GOOS)
+	}
+
+	if cmd == nil {
+		return fmt.Errorf("failed to create command")
+	}
+
+	log.Printf("[OpenFileLocation] Executing command: %s %v", cmd.Path, cmd.Args)
+	err := cmd.Start()
+	if err != nil {
+		log.Printf("[OpenFileLocation] ERROR: Failed to start command: %v", err)
+		return fmt.Errorf("failed to open file location: %v", err)
+	}
+
+	log.Printf("[OpenFileLocation] Command started successfully")
+	return nil
 }

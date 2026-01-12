@@ -23,13 +23,14 @@ type FileInfo struct {
 }
 
 type AudioMetadata struct {
-	Title       string `json:"title"`
-	Artist      string `json:"artist"`
-	Album       string `json:"album"`
-	AlbumArtist string `json:"album_artist"`
-	TrackNumber int    `json:"track_number"`
-	DiscNumber  int    `json:"disc_number"`
-	Year        string `json:"year"`
+	Title          string `json:"title"`
+	Artist         string `json:"artist"`
+	Album          string `json:"album"`
+	AlbumArtist    string `json:"album_artist"`
+	TrackNumber    int    `json:"track_number"`
+	DiscNumber     int    `json:"disc_number"`
+	Year           string `json:"year"`
+	DurationMillis int    `json:"duration_millis"`
 }
 
 type RenamePreview struct {
@@ -120,16 +121,29 @@ func ReadAudioMetadata(filePath string) (*AudioMetadata, error) {
 
 	ext := strings.ToLower(filepath.Ext(filePath))
 
+	var metadata *AudioMetadata
+	var err error
+
 	switch ext {
 	case ".flac":
-		return readFlacMetadata(filePath)
+		metadata, err = readFlacMetadata(filePath)
 	case ".mp3":
-		return readMp3Metadata(filePath)
+		metadata, err = readMp3Metadata(filePath)
 	case ".m4a":
-		return readM4aMetadata(filePath)
+		metadata, err = readM4aMetadata(filePath)
 	default:
 		return nil, fmt.Errorf("unsupported file format: %s", ext)
 	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	// Get duration using ffprobe
+	duration, _ := getAudioDuration(filePath)
+	metadata.DurationMillis = duration
+
+	return metadata, nil
 }
 
 func readFlacMetadata(filePath string) (*AudioMetadata, error) {
@@ -305,6 +319,35 @@ func readMetadataWithFFprobe(filePath string) (*AudioMetadata, error) {
 	}
 
 	return metadata, nil
+}
+
+func getAudioDuration(filePath string) (int, error) {
+	ffprobePath, err := GetFFprobePath()
+	if err != nil {
+		return 0, err
+	}
+
+	cmd := exec.Command(ffprobePath,
+		"-v", "error",
+		"-show_entries", "format=duration",
+		"-of", "default=noprint_wrappers=1:nokey=1",
+		filePath,
+	)
+
+	setHideWindow(cmd)
+
+	output, err := cmd.Output()
+	if err != nil {
+		return 0, err
+	}
+
+	durationStr := strings.TrimSpace(string(output))
+	durationSec, err := strconv.ParseFloat(durationStr, 64)
+	if err != nil {
+		return 0, err
+	}
+
+	return int(durationSec * 1000), nil
 }
 
 func readM4aMetadata(filePath string) (*AudioMetadata, error) {
