@@ -1,0 +1,13 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=SpotiFLAC
+Comment=Get Spotify tracks in true FLAC from Tidal, Qobuz & Amazon Music
+Exec=/home/mouncef/Desktop/SpotiFLAC/build/bin/SpotiFLAC
+Icon=/home/mouncef/Desktop/SpotiFLAC/build/appicon.png
+Terminal=false
+Categories=Audio;Music;AudioVideo;
+Keywords=spotify;music;flac;download;tidal;qobuz;amazon;
+StartupNotify=true
+MimeType=
+
