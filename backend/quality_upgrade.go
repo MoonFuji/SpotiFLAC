@@ -87,7 +87,18 @@ func ScanFolderForQualityUpgrades(ctx context.Context, folderPath string) ([]Qua
 			continue
 		}
 
-		searchQuery := fmt.Sprintf("%s %s", metadata.Title, metadata.Artist)
+		// Clean title and artist for better search
+		cleanTitle := cleanSearchString(metadata.Title)
+		cleanArtist := cleanSearchString(metadata.Artist)
+		
+		// Build search query: prefer "artist title" format for better Spotify results
+		// But if artist is unknown, try title-only search
+		var searchQuery string
+		if strings.EqualFold(cleanArtist, "Unknown Artist") || cleanArtist == "" {
+			searchQuery = cleanTitle
+		} else {
+			searchQuery = fmt.Sprintf("%s %s", cleanArtist, cleanTitle)
+		}
 		suggestion.SearchQuery = searchQuery
 
 		// Check cache first
@@ -160,142 +171,150 @@ func ScanFolderForQualityUpgrades(ctx context.Context, folderPath string) ([]Qua
 	return suggestions, nil
 }
 
+// cleanSearchString removes junk from search strings
+func cleanSearchString(s string) string {
+	s = strings.TrimSpace(s)
+	// Remove quality indicators and common junk
+	reJunk := regexp.MustCompile(`(?i)\s*\([^)]*(?:320k?|128k?|256k?|flac|mp3|m4a|aac|ogg|opus|wav|hd|hq|official|video|lyrics?|audio|explicit|clean|version|remix|live|instrumental|prod\.?|feat\.?|ft\.?)[^)]*\)`)
+	s = reJunk.ReplaceAllString(s, "")
+	s = strings.TrimSpace(s)
+	return s
+}
+
+// scoreMatch calculates a match score between metadata and a search result
+// Higher score = better match
+func scoreMatch(metadata *AudioMetadata, result *SearchResult) int {
+	score := 0
+
+	normalize := func(s string) string {
+		s = strings.ToLower(s)
+		s = strings.TrimSpace(s)
+		// Remove common punctuation for better matching
+		s = strings.ReplaceAll(s, "'", "")
+		s = strings.ReplaceAll(s, "&", "and")
+		return s
+	}
+
+	metadataTitle := normalize(cleanSearchString(metadata.Title))
+	metadataArtist := normalize(cleanSearchString(metadata.Artist))
+	resultTitle := normalize(result.Name)
+	resultArtists := normalize(result.Artists)
+
+	// Title matching (most important)
+	if metadataTitle == resultTitle {
+		score += 100 // Exact title match
+	} else {
+		// Check if title words match (better than substring)
+		metadataTitleWords := strings.Fields(metadataTitle)
+		resultTitleWords := strings.Fields(resultTitle)
+		matchedWords := 0
+		for _, word := range metadataTitleWords {
+			if len(word) < 2 {
+				continue // Skip very short words
+			}
+			for _, rWord := range resultTitleWords {
+				if word == rWord {
+					matchedWords++
+					break
+				}
+			}
+		}
+		if len(metadataTitleWords) > 0 {
+			wordMatchRatio := float64(matchedWords) / float64(len(metadataTitleWords))
+			score += int(wordMatchRatio * 60) // Up to 60 points for word matching
+		}
+
+		// Substring matching (less reliable but still useful)
+		if strings.Contains(resultTitle, metadataTitle) {
+			score += 30
+		} else if strings.Contains(metadataTitle, resultTitle) {
+			score += 20
+		}
+	}
+
+	// Artist matching
+	if metadataArtist == resultArtists {
+		score += 50 // Exact artist match
+	} else {
+		// Check if artist name appears in result artists
+		if strings.Contains(resultArtists, metadataArtist) {
+			score += 30
+		} else if strings.Contains(metadataArtist, resultArtists) {
+			score += 20
+		} else {
+			// Try word-by-word matching for artists
+			metadataArtistWords := strings.Fields(metadataArtist)
+			resultArtistWords := strings.Fields(resultArtists)
+			for _, word := range metadataArtistWords {
+				if len(word) < 2 {
+					continue
+				}
+				for _, rWord := range resultArtistWords {
+					if word == rWord {
+						score += 10
+						break
+					}
+				}
+			}
+		}
+	}
+
+	// Duration matching (bonus points)
+	if metadata.DurationMillis > 0 && result.Duration > 0 {
+		durationDiff := result.Duration - metadata.DurationMillis
+		if durationDiff < 0 {
+			durationDiff = -durationDiff
+		}
+		if durationDiff <= 1000 {
+			score += 20 // Within 1 second
+		} else if durationDiff <= 3000 {
+			score += 10 // Within 3 seconds
+		} else if durationDiff <= 5000 {
+			score += 5 // Within 5 seconds
+		} else if durationDiff > 10000 {
+			score -= 20 // More than 10 seconds difference - likely wrong match
+		}
+	}
+
+	return score
+}
+
 func findBestMatch(metadata *AudioMetadata, searchResults []SearchResult) *SearchResult {
 	if len(searchResults) == 0 {
 		return nil
 	}
 
-	normalize := func(s string) string {
-		s = strings.ToLower(s)
-		s = strings.TrimSpace(s)
-		return s
-	}
+	// Score all results and find the best match
+	bestScore := -1
+	bestIndex := -1
 
-	metadataTitle := normalize(metadata.Title)
-	metadataArtist := normalize(metadata.Artist)
-	metadataDuration := metadata.DurationMillis
-
-	// First pass: exact or very close matches with duration check
-	for _, result := range searchResults {
-		resultTitle := normalize(result.Name)
-		resultArtists := normalize(result.Artists)
-
-		titleMatch := metadataTitle == resultTitle ||
-			strings.Contains(resultTitle, metadataTitle) ||
-			strings.Contains(metadataTitle, resultTitle)
-		artistMatch := metadataArtist == resultArtists ||
-			strings.Contains(resultArtists, metadataArtist) ||
-			strings.Contains(metadataArtist, resultArtists)
-
-		// Duration check: within 3 seconds tolerance
-		durationMatch := true
-		if metadataDuration > 0 && result.Duration > 0 {
-			durationDiff := result.Duration - metadataDuration
-			if durationDiff < 0 {
-				durationDiff = -durationDiff
-			}
-			durationMatch = durationDiff <= 3000 // 3 seconds tolerance
-		}
-
-		if titleMatch && artistMatch && durationMatch {
-			return &result
+	for i := range searchResults {
+		score := scoreMatch(metadata, &searchResults[i])
+		if score > bestScore {
+			bestScore = score
+			bestIndex = i
 		}
 	}
 
-	// Second pass: title match with duration
-	for _, result := range searchResults {
-		resultTitle := normalize(result.Name)
-
-		titleMatch := metadataTitle == resultTitle ||
-			strings.Contains(resultTitle, metadataTitle) ||
-			strings.Contains(metadataTitle, resultTitle)
-
-		durationMatch := true
-		if metadataDuration > 0 && result.Duration > 0 {
-			durationDiff := result.Duration - metadataDuration
-			if durationDiff < 0 {
-				durationDiff = -durationDiff
-			}
-			durationMatch = durationDiff <= 5000 // 5 seconds tolerance for title-only
-		}
-
-		if titleMatch && durationMatch {
-			return &result
-		}
+	// Only return a match if score is above threshold
+	// This prevents returning completely unrelated tracks
+	if bestIndex >= 0 && bestScore >= 30 {
+		return &searchResults[bestIndex]
 	}
 
-	// Third pass: artist + title without duration
-	for _, result := range searchResults {
-		resultTitle := normalize(result.Name)
-		resultArtists := normalize(result.Artists)
-
-		titleMatch := strings.Contains(resultTitle, metadataTitle) || strings.Contains(metadataTitle, resultTitle)
-		artistMatch := strings.Contains(resultArtists, metadataArtist) || strings.Contains(metadataArtist, resultArtists)
-
-		if titleMatch && artistMatch {
-			return &result
-		}
-	}
-
-	// Fallback: return first result
-	return &searchResults[0]
+	// If no good match found, return nil instead of random result
+	return nil
 }
 
 func calculateMatchConfidence(metadata *AudioMetadata, track *SearchResult) string {
-	normalize := func(s string) string {
-		s = strings.ToLower(s)
-		s = strings.TrimSpace(s)
-		return s
-	}
+	score := scoreMatch(metadata, track)
 
-	metadataTitle := normalize(metadata.Title)
-	metadataArtist := normalize(metadata.Artist)
-	trackTitle := normalize(track.Name)
-	trackArtists := normalize(track.Artists)
-
-	titleExact := metadataTitle == trackTitle
-	titleContains := strings.Contains(trackTitle, metadataTitle) || strings.Contains(metadataTitle, trackTitle)
-	artistExact := metadataArtist == trackArtists
-	artistContains := strings.Contains(trackArtists, metadataArtist) || strings.Contains(metadataArtist, trackArtists)
-
-	// Check duration match
-	metadataDuration := metadata.DurationMillis
-	durationClose := false
-	durationExact := false
-
-	if metadataDuration > 0 && track.Duration > 0 {
-		durationDiff := track.Duration - metadataDuration
-		if durationDiff < 0 {
-			durationDiff = -durationDiff
-		}
-		durationExact = durationDiff <= 1000 // Within 1 second
-		durationClose = durationDiff <= 3000 // Within 3 seconds
-	}
-
-	// High confidence: exact matches with duration confirmation
-	if titleExact && artistExact && (durationExact || metadataDuration == 0) {
+	// Use score thresholds to determine confidence
+	if score >= 120 {
 		return "high"
-	}
-	if titleExact && artistContains && durationExact {
-		return "high"
-	}
-
-	// Medium confidence: good matches with duration check
-	if titleContains && artistExact && durationClose {
+	} else if score >= 70 {
 		return "medium"
-	}
-	if titleExact && artistContains && (durationClose || metadataDuration == 0) {
-		return "medium"
-	}
-	if titleContains && artistContains && durationClose {
-		return "medium"
-	}
-
-	// Low confidence: weak matches
-	if titleContains && artistContains {
-		return "low"
-	}
-	if (titleContains || artistContains) && durationClose {
+	} else if score >= 30 {
 		return "low"
 	}
 
@@ -313,17 +332,32 @@ func parseFilenameForMetadata(fileName string) *AudioMetadata {
 		return nil
 	}
 
+	// Remove common junk patterns first (quality indicators, years, etc.)
+	reJunk := regexp.MustCompile(`(?i)\s*\([^)]*(?:320k?|128k?|256k?|flac|mp3|m4a|aac|ogg|opus|wav|hd|hq|official|video|lyrics?|audio|explicit|clean|version|remix|live|instrumental|prod\.?|feat\.?|ft\.?)[^)]*\)`)
+	nameWithoutExt = reJunk.ReplaceAllString(nameWithoutExt, "")
+	nameWithoutExt = strings.TrimSpace(nameWithoutExt)
+
+	// Remove year patterns at the end: (2005), [2005], etc.
+	reYear := regexp.MustCompile(`(?i)\s*[\(\[\{](\d{4})[\)\]\}]$`)
+	nameWithoutExt = reYear.ReplaceAllString(nameWithoutExt, "")
+	nameWithoutExt = strings.TrimSpace(nameWithoutExt)
+
 	patterns := []struct {
 		regex     *regexp.Regexp
 		titleIdx  int
 		artistIdx int
 	}{
-		{regexp.MustCompile(`(?i)^(\d+)[\.\s\-]+(.+?)\s*-\s*(.+)$`), 3, 2},
-		{regexp.MustCompile(`(?i)^(.+?)\s*-\s*(.+)$`), 2, 1},
+		// Pattern: "01. Title - Artist" or "01 Title - Artist"
+		{regexp.MustCompile(`(?i)^(\d+)[\.\s\-]+(.+?)\s*-\s*(.+)$`), 2, 3},
+		// Pattern: "Title - Artist"
+		{regexp.MustCompile(`(?i)^(.+?)\s*-\s*(.+)$`), 1, 2},
+		// Pattern: "Title by Artist"
 		{regexp.MustCompile(`(?i)^(.+?)\s+by\s+(.+)$`), 1, 2},
+		// Pattern: "Title feat. Artist" or "Title ft. Artist"
 		{regexp.MustCompile(`(?i)^(.+?)\s+feat\.?\s+(.+)$`), 1, 2},
 		{regexp.MustCompile(`(?i)^(.+?)\s+ft\.?\s+(.+)$`), 1, 2},
 		{regexp.MustCompile(`(?i)^(.+?)\s+featuring\s+(.+)$`), 1, 2},
+		// Pattern: "Title vs Artist" or "Title x Artist"
 		{regexp.MustCompile(`(?i)^(.+?)\s+vs\.?\s+(.+)$`), 1, 2},
 		{regexp.MustCompile(`(?i)^(.+?)\s+x\s+(.+)$`), 1, 2},
 	}
@@ -345,6 +379,29 @@ func parseFilenameForMetadata(fileName string) *AudioMetadata {
 		}
 	}
 
+	// Try to detect "Title Artist" pattern (no separator)
+	// This handles cases like "1 Thing Amerie" where artist name comes after title
+	// We'll try to split on the last word(s) that could be an artist name
+	// Common pattern: short title (1-3 words) followed by artist name
+	words := strings.Fields(nameWithoutExt)
+	if len(words) >= 3 {
+		// Try splitting: first 1-2 words as title, rest as artist
+		// This handles "1 Thing Amerie" -> "1 Thing" / "Amerie"
+		for i := 1; i <= 2 && i < len(words); i++ {
+			title := strings.Join(words[:i], " ")
+			artist := strings.Join(words[i:], " ")
+			
+			// Basic validation: artist should be 1-3 words typically
+			artistWords := strings.Fields(artist)
+			if len(artistWords) <= 3 && len(title) > 1 && len(artist) > 1 {
+				metadata.Title = strings.TrimSpace(title)
+				metadata.Artist = strings.TrimSpace(artist)
+				return metadata
+			}
+		}
+	}
+
+	// Fallback: treat entire filename as title
 	if nameWithoutExt != "" {
 		metadata.Title = nameWithoutExt
 		metadata.Artist = "Unknown Artist"
@@ -397,7 +454,18 @@ func ScanSingleFileForQualityUpgrade(ctx context.Context, filePath string) (*Qua
 		return suggestion, nil
 	}
 
-	searchQuery := fmt.Sprintf("%s %s", metadata.Title, metadata.Artist)
+	// Clean title and artist for better search
+	cleanTitle := cleanSearchString(metadata.Title)
+	cleanArtist := cleanSearchString(metadata.Artist)
+	
+	// Build search query: prefer "artist title" format for better Spotify results
+	// But if artist is unknown, try title-only search
+	var searchQuery string
+	if strings.EqualFold(cleanArtist, "Unknown Artist") || cleanArtist == "" {
+		searchQuery = cleanTitle
+	} else {
+		searchQuery = fmt.Sprintf("%s %s", cleanArtist, cleanTitle)
+	}
 	suggestion.SearchQuery = searchQuery
 
 	// Check cache first
@@ -604,3 +672,4 @@ func buildDuplicateGroups(groups map[string]*duplicateGroupBuilder) []DuplicateG
 
 	return duplicates
 }
+
