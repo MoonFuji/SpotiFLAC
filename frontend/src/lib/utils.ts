@@ -2,6 +2,7 @@ import { clsx, type ClassValue } from "clsx";
 import { twMerge } from "tailwind-merge";
 import { BrowserOpenURL } from "../../wailsjs/runtime/runtime";
 import type { Settings } from "./settings";
+import { toastWithSound as toast } from "./toast-with-sound";
 export function cn(...inputs: ClassValue[]) {
     return twMerge(clsx(inputs));
 }
@@ -19,11 +20,11 @@ export function joinPath(os: string, ...parts: string[]): string {
         return "";
     const joined = filtered
         .map((p, i) => {
-        if (i === 0) {
-            return p.replace(/[/\\]+$/g, "");
-        }
-        return p.replace(/^[/\\]+|[/\\]+$/g, "");
-    })
+            if (i === 0) {
+                return p.replace(/[/\\]+$/g, "");
+            }
+            return p.replace(/^[/\\]+|[/\\]+$/g, "");
+        })
         .filter(Boolean)
         .join(sep);
     return joined;
@@ -43,6 +44,32 @@ export function openExternal(url: string) {
     catch (error) {
         if (typeof window !== "undefined") {
             window.open(url, "_blank", "noopener,noreferrer");
+        }
+    }
+}
+
+/**
+ * Opens a Spotify track in the Spotify app (desktop) or web browser.
+ * Tries spotify: protocol first (opens desktop app), then falls back to web URL.
+ * @param spotifyId - The Spotify track ID
+ * @param externalUrl - Optional external URL from Spotify API (preferred over constructing URL)
+ */
+export function openInSpotify(spotifyId: string, externalUrl?: string): void {
+    if (!spotifyId) return;
+
+    try {
+        // Try spotify: protocol first (opens desktop app)
+        const spotifyProtocolUrl = `spotify:track:${spotifyId}`;
+        BrowserOpenURL(spotifyProtocolUrl);
+    } catch (err) {
+        // Fallback to web URL
+        const webUrl = externalUrl || `https://open.spotify.com/track/${spotifyId}`;
+        try {
+            BrowserOpenURL(webUrl);
+        } catch (fallbackErr) {
+            toast.error("Failed to open Spotify", {
+                description: "Please make sure Spotify is installed or try opening manually",
+            });
         }
     }
 }
