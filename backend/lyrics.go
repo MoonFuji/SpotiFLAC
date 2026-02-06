@@ -61,6 +61,30 @@ type LyricsDownloadResponse struct {
 	AlreadyExists bool   `json:"already_exists,omitempty"`
 }
 
+type FetchLyricsForFileRequest struct {
+	FilePath     string `json:"file_path"`
+	SpotifyID    string `json:"spotify_id,omitempty"`
+	TrackName    string `json:"track_name,omitempty"`
+	ArtistName   string `json:"artist_name,omitempty"`
+	EmbedInFile  bool   `json:"embed_in_file"`
+	SaveAsLRC    bool   `json:"save_as_lrc"`
+	SkipIfExists bool   `json:"skip_if_exists"` // Skip fetching if lyrics already exist (embedded or .lrc file)
+}
+
+type FetchLyricsForFileResponse struct {
+	Success          bool   `json:"success"`
+	Message          string `json:"message"`
+	LRCFile          string `json:"lrc_file,omitempty"`
+	Embedded         bool   `json:"embedded"`
+	LyricsType       string `json:"lyrics_type,omitempty"`
+	Source           string `json:"source,omitempty"`
+	Error            string `json:"error,omitempty"`
+	LinesCount       int    `json:"lines_count,omitempty"`
+	AlreadyHasLyrics bool   `json:"already_has_lyrics,omitempty"` // File already had embedded lyrics
+	AlreadyHasLRC    bool   `json:"already_has_lrc,omitempty"`    // .lrc file already exists
+	Skipped          bool   `json:"skipped,omitempty"`            // True if skipped due to existing lyrics
+}
+
 type LyricsClient struct {
 	httpClient *http.Client
 }
@@ -386,6 +410,192 @@ func findAudioFileForLyrics(dir, trackName, artistName string) string {
 	}
 
 	return ""
+}
+
+// FetchLyricsForFile fetches lyrics for an existing audio file and optionally embeds them or saves as .lrc
+func (c *LyricsClient) FetchLyricsForFile(req FetchLyricsForFileRequest) (*FetchLyricsForFileResponse, error) {
+	if req.FilePath == "" {
+		return &FetchLyricsForFileResponse{
+			Success: false,
+			Error:   "File path is required",
+		}, fmt.Errorf("file path is required")
+	}
+
+	// Check if file exists
+	if _, err := os.Stat(req.FilePath); os.IsNotExist(err) {
+		return &FetchLyricsForFileResponse{
+			Success: false,
+			Error:   "File does not exist",
+		}, fmt.Errorf("file does not exist: %s", req.FilePath)
+	}
+
+	// Check for existing lyrics if SkipIfExists is enabled
+	hasEmbeddedLyrics := false
+	hasLRCFile := false
+
+	// Check for embedded lyrics
+	existingLyrics, err := ExtractLyrics(req.FilePath)
+	if err == nil && strings.TrimSpace(existingLyrics) != "" {
+		hasEmbeddedLyrics = true
+	}
+
+	// Check for existing .lrc file
+	dir := filepath.Dir(req.FilePath)
+	baseName := strings.TrimSuffix(filepath.Base(req.FilePath), filepath.Ext(req.FilePath))
+	lrcPath := filepath.Join(dir, baseName+".lrc")
+	if _, err := os.Stat(lrcPath); err == nil {
+		hasLRCFile = true
+	}
+
+	// If SkipIfExists is enabled and lyrics already exist, skip fetching
+	if req.SkipIfExists {
+		// Determine what we need to check based on what was requested
+		shouldSkip := false
+		skipReason := ""
+
+		if req.EmbedInFile && req.SaveAsLRC {
+			// Both requested: skip only if both exist
+			if hasEmbeddedLyrics && hasLRCFile {
+				shouldSkip = true
+				skipReason = "File already has embedded lyrics and .lrc file"
+			}
+		} else if req.EmbedInFile {
+			// Only embed requested: skip if embedded lyrics exist
+			if hasEmbeddedLyrics {
+				shouldSkip = true
+				skipReason = "File already has embedded lyrics"
+			}
+		} else if req.SaveAsLRC {
+			// Only .lrc requested: skip if .lrc file exists
+			if hasLRCFile {
+				shouldSkip = true
+				skipReason = ".lrc file already exists"
+			}
+		} else {
+			// Neither requested (just checking): skip if either exists
+			if hasEmbeddedLyrics || hasLRCFile {
+				shouldSkip = true
+				skipReason = "Lyrics already exist"
+			}
+		}
+
+		if shouldSkip {
+			return &FetchLyricsForFileResponse{
+				Success:          true,
+				Message:          skipReason,
+				AlreadyHasLyrics: hasEmbeddedLyrics,
+				AlreadyHasLRC:    hasLRCFile,
+				Skipped:          true,
+			}, nil
+		}
+	}
+
+	// Get track info from metadata if not provided
+	trackName := req.TrackName
+	artistName := req.ArtistName
+
+	if trackName == "" || artistName == "" {
+		metadata, err := ReadAudioMetadata(req.FilePath)
+		if err == nil && metadata != nil {
+			if trackName == "" {
+				trackName = metadata.Title
+			}
+			if artistName == "" {
+				artistName = metadata.Artist
+			}
+		}
+	}
+
+	if trackName == "" || artistName == "" {
+		return &FetchLyricsForFileResponse{
+			Success: false,
+			Error:   "Could not determine track name or artist from file metadata",
+		}, fmt.Errorf("missing track info")
+	}
+
+	// Get audio duration for better lyrics matching
+	audioDuration := 0
+	duration, err := GetAudioDuration(req.FilePath)
+	if err == nil && duration > 0 {
+		audioDuration = int(duration)
+	}
+
+	// Fetch lyrics from all sources
+	lyrics, source, err := c.FetchLyricsAllSources(req.SpotifyID, trackName, artistName, audioDuration)
+	if err != nil {
+		return &FetchLyricsForFileResponse{
+			Success: false,
+			Error:   fmt.Sprintf("Lyrics not found: %v", err),
+		}, err
+	}
+
+	if lyrics == nil || len(lyrics.Lines) == 0 {
+		return &FetchLyricsForFileResponse{
+			Success: false,
+			Error:   "No lyrics content found",
+		}, fmt.Errorf("no lyrics content found")
+	}
+
+	// Convert to LRC format
+	lrcContent := c.ConvertToLRC(lyrics, trackName, artistName)
+
+	response := &FetchLyricsForFileResponse{
+		Success:    true,
+		LyricsType: lyrics.SyncType,
+		Source:     source,
+		LinesCount: len(lyrics.Lines),
+	}
+
+	// Embed in file if requested
+	if req.EmbedInFile {
+		ext := strings.ToLower(filepath.Ext(req.FilePath))
+		var embedErr error
+
+		switch ext {
+		case ".flac":
+			embedErr = EmbedLyricsOnly(req.FilePath, lrcContent)
+		case ".mp3":
+			embedErr = EmbedLyricsOnlyMP3(req.FilePath, lrcContent)
+		case ".m4a":
+			embedErr = embedLyricsToM4A(req.FilePath, lrcContent)
+		default:
+			embedErr = fmt.Errorf("unsupported format for lyrics embedding: %s", ext)
+		}
+
+		if embedErr != nil {
+			response.Message = fmt.Sprintf("Lyrics found but failed to embed: %v", embedErr)
+			response.Embedded = false
+		} else {
+			response.Embedded = true
+			response.Message = "Lyrics embedded successfully"
+		}
+	}
+
+	// Save as .lrc file if requested
+	if req.SaveAsLRC {
+		dir := filepath.Dir(req.FilePath)
+		baseName := strings.TrimSuffix(filepath.Base(req.FilePath), filepath.Ext(req.FilePath))
+		lrcPath := filepath.Join(dir, baseName+".lrc")
+
+		if err := os.WriteFile(lrcPath, []byte(lrcContent), 0644); err != nil {
+			if response.Message != "" {
+				response.Message += "; "
+			}
+			response.Message += fmt.Sprintf("Failed to save .lrc file: %v", err)
+		} else {
+			response.LRCFile = lrcPath
+			if response.Message != "" {
+				response.Message += "; "
+			}
+			response.Message += "LRC file saved"
+		}
+	}
+
+	if response.Message == "" {
+		response.Message = fmt.Sprintf("Lyrics found from %s (%d lines)", source, len(lyrics.Lines))
+	}
+
+	return response, nil
 }
 
 func (c *LyricsClient) DownloadLyrics(req LyricsDownloadRequest) (*LyricsDownloadResponse, error) {

@@ -74,7 +74,28 @@ type DownloadResponse struct {
 	ItemID        string `json:"item_id,omitempty"`
 }
 
-func (a *App) GetStreamingURLs(spotifyTrackID string) (string, error) {
+func isValidISRC(isrc string) bool {
+	if len(isrc) != 12 {
+		return false
+	}
+	for _, ch := range isrc {
+		if (ch < 'A' || ch > 'Z') && (ch < '0' || ch > '9') {
+			return false
+		}
+	}
+	return true
+}
+
+func (a *App) GetStreamingURLs(spotifyTrackID string) (result string, err error) {
+	// Recover from any panics to prevent app crash
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Printf("PANIC in GetStreamingURLs: %v\n", r)
+			result = ""
+			err = fmt.Errorf("streaming URLs lookup crashed: %v", r)
+		}
+	}()
+
 	if spotifyTrackID == "" {
 		return "", fmt.Errorf("spotify track ID is required")
 	}
@@ -91,6 +112,55 @@ func (a *App) GetStreamingURLs(spotifyTrackID string) (string, error) {
 		return "", fmt.Errorf("failed to encode response: %v", err)
 	}
 
+	return string(jsonData), nil
+}
+
+// GetAlternativeSpotifyTrackIDs searches Spotify for other releases/versions of the same track
+// (e.g. different album, reissue) and returns their track IDs, excluding the given ID.
+// Used when the primary track fails on all services so we can try another version.
+func (a *App) GetAlternativeSpotifyTrackIDs(trackName, artistName, excludeSpotifyID string, limit int) (string, error) {
+	fmt.Printf("[GetAlternativeSpotifyTrackIDs] Called (track=%q artist=%q exclude=%s)\n", trackName, artistName, excludeSpotifyID)
+	if trackName == "" && artistName == "" {
+		return "[]", nil
+	}
+	if limit <= 0 || limit > 20 {
+		limit = 10
+	}
+	fmt.Printf("[GetAlternativeSpotifyTrackIDs] Searching other Spotify versions...\n")
+
+	query := strings.TrimSpace(artistName + " " + trackName)
+	if query == "" {
+		query = trackName
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	results, err := backend.SearchSpotifyByType(ctx, query, "track", limit*2, 0)
+	if err != nil {
+		return "", fmt.Errorf("search failed: %w", err)
+	}
+
+	excludeLower := strings.ToLower(strings.TrimSpace(excludeSpotifyID))
+	ids := make([]string, 0, limit)
+	for _, r := range results {
+		id := strings.TrimSpace(r.ID)
+		if id == "" {
+			continue
+		}
+		if excludeLower != "" && strings.ToLower(id) == excludeLower {
+			continue
+		}
+		ids = append(ids, id)
+		if len(ids) >= limit {
+			break
+		}
+	}
+
+	jsonData, err := json.Marshal(ids)
+	if err != nil {
+		return "[]", nil
+	}
+	fmt.Printf("[GetAlternativeSpotifyTrackIDs] Found %d other version(s), trying each...\n", len(ids))
 	return string(jsonData), nil
 }
 
@@ -168,13 +238,33 @@ func (a *App) SearchSpotifyByType(req SpotifySearchByTypeRequest) ([]backend.Sea
 	return backend.SearchSpotifyByType(ctx, req.Query, req.SearchType, req.Limit, req.Offset)
 }
 
-func (a *App) DownloadTrack(req DownloadRequest) (DownloadResponse, error) {
+func (a *App) DownloadTrack(req DownloadRequest) (response DownloadResponse, err error) {
+	// Recover from any panics to prevent app crash
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Printf("PANIC in DownloadTrack: %v\n", r)
+			response = DownloadResponse{
+				Success: false,
+				Error:   fmt.Sprintf("Download crashed: %v", r),
+			}
+			err = fmt.Errorf("download panic: %v", r)
+		}
+	}()
 
-	if req.Service == "qobuz" && req.ISRC == "" && req.SpotifyID == "" {
-		return DownloadResponse{
-			Success: false,
-			Error:   "Spotify ID is required for Qobuz",
-		}, fmt.Errorf("spotify ID is required for Qobuz")
+	if req.Service == "qobuz" {
+		if req.ISRC != "" && !isValidISRC(strings.ToUpper(req.ISRC)) {
+			fmt.Printf("Invalid ISRC provided for Qobuz, falling back to Deezer lookup: %s\n", req.ISRC)
+			req.ISRC = ""
+		} else if req.ISRC != "" {
+			req.ISRC = strings.ToUpper(req.ISRC)
+		}
+
+		if req.ISRC == "" && req.SpotifyID == "" {
+			return DownloadResponse{
+				Success: false,
+				Error:   "Spotify ID is required for Qobuz",
+			}, fmt.Errorf("spotify ID is required for Qobuz")
+		}
 	}
 
 	if req.Service == "" {
@@ -192,7 +282,6 @@ func (a *App) DownloadTrack(req DownloadRequest) (DownloadResponse, error) {
 		req.AudioFormat = "LOSSLESS"
 	}
 
-	var err error
 	var filename string
 
 	if req.FilenameFormat == "" {
@@ -373,6 +462,8 @@ func (a *App) DownloadTrack(req DownloadRequest) (DownloadResponse, error) {
 	}
 
 	if err != nil {
+		errMsg := fmt.Sprintf("Download failed: %v", err)
+		fmt.Printf("DownloadTrack error: %v\n", err)
 
 		if filename != "" && !strings.HasPrefix(filename, "EXISTS:") {
 
@@ -386,7 +477,7 @@ func (a *App) DownloadTrack(req DownloadRequest) (DownloadResponse, error) {
 
 		return DownloadResponse{
 			Success: false,
-			Error:   fmt.Sprintf("Download failed: %v", err),
+			Error:   errMsg,
 			ItemID:  itemID,
 		}, err
 	}
@@ -399,49 +490,71 @@ func (a *App) DownloadTrack(req DownloadRequest) (DownloadResponse, error) {
 
 	if !alreadyExists && req.SpotifyID != "" && req.EmbedLyrics && strings.HasSuffix(filename, ".flac") {
 		go func(filePath, spotifyID, trackName, artistName string) {
-			fmt.Printf("\n========== LYRICS FETCH START ==========\n")
-			fmt.Printf("Spotify ID: %s\n", spotifyID)
-			fmt.Printf("Track: %s\n", trackName)
-			fmt.Printf("Artist: %s\n", artistName)
-			fmt.Println("Searching all sources...")
+			defer func() {
+				if r := recover(); r != nil {
+					fmt.Printf("PANIC in lyrics embed: %v\n", r)
+				}
+			}()
 
-			lyricsClient := backend.NewLyricsClient()
+			start := time.Now()
+			timeout := 25 * time.Second
+			done := make(chan struct{})
 
-			lyricsResp, source, err := lyricsClient.FetchLyricsAllSources(spotifyID, trackName, artistName, 0)
-			if err != nil {
-				fmt.Printf("All sources failed: %v\n", err)
-				fmt.Printf("========== LYRICS FETCH END (FAILED) ==========\n\n")
-				return
-			}
+			go func() {
+				defer func() {
+					if r := recover(); r != nil {
+						fmt.Printf("PANIC in lyrics embed worker: %v\n", r)
+					}
+				}()
+				defer close(done)
 
-			if lyricsResp == nil || len(lyricsResp.Lines) == 0 {
-				fmt.Println("No lyrics content found")
-				fmt.Printf("========== LYRICS FETCH END (FAILED) ==========\n\n")
-				return
-			}
+				fmt.Printf("\n========== LYRICS FETCH START ==========\n")
+				fmt.Printf("Spotify ID: %s\n", spotifyID)
+				fmt.Printf("Track: %s\n", trackName)
+				fmt.Printf("Artist: %s\n", artistName)
+				fmt.Println("Searching all sources...")
 
-			fmt.Printf("Lyrics found from: %s\n", source)
-			fmt.Printf("Sync type: %s\n", lyricsResp.SyncType)
-			fmt.Printf("Total lines: %d\n", len(lyricsResp.Lines))
+				lyricsClient := backend.NewLyricsClient()
 
-			lyrics := lyricsClient.ConvertToLRC(lyricsResp, trackName, artistName)
-			if lyrics == "" {
-				fmt.Println("No lyrics content to embed")
-				fmt.Printf("========== LYRICS FETCH END (FAILED) ==========\n\n")
-				return
-			}
+				lyricsResp, source, err := lyricsClient.FetchLyricsAllSources(spotifyID, trackName, artistName, 0)
+				if err != nil {
+					fmt.Printf("All sources failed: %v\n", err)
+					fmt.Printf("========== LYRICS FETCH END (FAILED) ==========\n\n")
+					return
+				}
 
-			fmt.Printf("\n--- Full LRC Content ---\n")
-			fmt.Println(lyrics)
-			fmt.Printf("--- End LRC Content ---\n\n")
+				if lyricsResp == nil || len(lyricsResp.Lines) == 0 {
+					fmt.Println("No lyrics content found")
+					fmt.Printf("========== LYRICS FETCH END (FAILED) ==========\n\n")
+					return
+				}
 
-			fmt.Printf("Embedding into: %s\n", filePath)
-			if err := backend.EmbedLyricsOnly(filePath, lyrics); err != nil {
-				fmt.Printf("Failed to embed lyrics: %v\n", err)
-				fmt.Printf("========== LYRICS FETCH END (FAILED) ==========\n\n")
-			} else {
-				fmt.Printf("Lyrics embedded successfully!\n")
-				fmt.Printf("========== LYRICS FETCH END (SUCCESS) ==========\n\n")
+				fmt.Printf("Lyrics found from: %s\n", source)
+				fmt.Printf("Sync type: %s\n", lyricsResp.SyncType)
+				fmt.Printf("Total lines: %d\n", len(lyricsResp.Lines))
+
+				lyrics := lyricsClient.ConvertToLRC(lyricsResp, trackName, artistName)
+				if lyrics == "" {
+					fmt.Println("No lyrics content to embed")
+					fmt.Printf("========== LYRICS FETCH END (FAILED) ==========\n\n")
+					return
+				}
+
+				fmt.Printf("Embedding into: %s\n", filePath)
+				if err := backend.EmbedLyricsOnly(filePath, lyrics); err != nil {
+					fmt.Printf("Failed to embed lyrics: %v\n", err)
+					fmt.Printf("========== LYRICS FETCH END (FAILED) ==========\n\n")
+				} else {
+					fmt.Printf("Lyrics embedded successfully!\n")
+					fmt.Printf("========== LYRICS FETCH END (SUCCESS) ==========\n\n")
+				}
+			}()
+
+			select {
+			case <-done:
+				fmt.Printf("Lyrics embedding finished in %s\n", time.Since(start))
+			case <-time.After(timeout):
+				fmt.Printf("Lyrics embedding timed out after %s\n", timeout)
 			}
 		}(filename, req.SpotifyID, req.TrackName, req.ArtistName)
 	}
@@ -901,8 +1014,18 @@ func (a *App) PreviewRenameFiles(files []string, format string) []backend.Rename
 	return backend.PreviewRename(files, format)
 }
 
+// PreviewRenameMismatched returns preview only for files not already matching the format (files that would be renamed).
+func (a *App) PreviewRenameMismatched(files []string, format string) []backend.RenamePreview {
+	return backend.PreviewRenameMismatched(files, format)
+}
+
 func (a *App) RenameFilesByMetadata(files []string, format string) []backend.RenameResult {
 	return backend.RenameFiles(files, format)
+}
+
+// RenameFilesFromPreview renames using existing preview data (no metadata read). Use after PreviewRename for efficient apply.
+func (a *App) RenameFilesFromPreview(previews []backend.RenamePreview) []backend.RenameResult {
+	return backend.RenameFilesFromPreview(previews)
 }
 
 func (a *App) ReadTextFile(filePath string) (string, error) {
@@ -1032,8 +1155,13 @@ func (a *App) CheckFilesExistence(outputDir string, tracks []CheckFileExistenceR
 			expectedPath := filepath.Join(outputDir, expectedFilename)
 
 			if fileInfo, err := os.Stat(expectedPath); err == nil && fileInfo.Size() > 100*1024 {
-				res.Exists = true
-				res.FilePath = expectedPath
+				complete, checkErr := backend.HasCompleteMetadataAndCover(expectedPath)
+				if checkErr == nil && complete {
+					res.Exists = true
+					res.FilePath = expectedPath
+				} else if checkErr == nil && !complete {
+					_ = os.Remove(expectedPath)
+				}
 			}
 
 			resultsChan <- result{index: idx, result: res}
@@ -1046,6 +1174,110 @@ func (a *App) CheckFilesExistence(outputDir string, tracks []CheckFileExistenceR
 		results[r.index] = r.result
 	}
 
+	return results
+}
+
+// CheckFilesExistenceInMusicDir checks if tracks already exist anywhere under rootDir (recursive).
+// Use this for playlist downloads so we skip tracks that exist in the whole music directory.
+func (a *App) CheckFilesExistenceInMusicDir(rootDir string, tracks []CheckFileExistenceRequest) []CheckFileExistenceResult {
+	if len(tracks) == 0 {
+		return []CheckFileExistenceResult{}
+	}
+	rootDir = backend.NormalizePath(rootDir)
+	defaultFilenameFormat := "title-artist"
+
+	// Build a map: base filename -> full path (first occurrence with size > 100KB)
+	type pathSize struct {
+		path string
+		size int64
+	}
+	fileMap := make(map[string]pathSize)
+	walkFn := func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		base := filepath.Base(path)
+		ext := strings.ToLower(filepath.Ext(base))
+		if ext != ".flac" && ext != ".mp3" {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil || info.Size() <= 100*1024 {
+			return nil
+		}
+		if _, exists := fileMap[base]; !exists {
+			fileMap[base] = pathSize{path: path, size: info.Size()}
+		}
+		return nil
+	}
+	_ = filepath.WalkDir(rootDir, walkFn)
+
+	// For each track, compute expected filename and look up in fileMap
+	results := make([]CheckFileExistenceResult, len(tracks))
+	for i, t := range tracks {
+		res := CheckFileExistenceResult{
+			SpotifyID:  t.SpotifyID,
+			TrackName:  t.TrackName,
+			ArtistName: t.ArtistName,
+			Exists:     false,
+		}
+		if t.TrackName == "" || t.ArtistName == "" {
+			results[i] = res
+			continue
+		}
+		filenameFormat := t.FilenameFormat
+		if filenameFormat == "" {
+			filenameFormat = defaultFilenameFormat
+		}
+		trackNumber := t.Position
+		if t.UseAlbumTrackNumber && t.TrackNumber > 0 {
+			trackNumber = t.TrackNumber
+		}
+		fileExt := ".flac"
+		if t.AudioFormat == "mp3" {
+			fileExt = ".mp3"
+		}
+		expectedFilenameBase := backend.BuildExpectedFilename(
+			t.TrackName,
+			t.ArtistName,
+			t.AlbumName,
+			t.AlbumArtist,
+			t.ReleaseDate,
+			filenameFormat,
+			t.IncludeTrackNumber,
+			trackNumber,
+			t.DiscNumber,
+			t.UseAlbumTrackNumber,
+		)
+		expectedFilename := strings.TrimSuffix(expectedFilenameBase, ".flac") + fileExt
+		if ps, ok := fileMap[expectedFilename]; ok {
+			complete, checkErr := backend.HasCompleteMetadataAndCover(ps.path)
+			if checkErr == nil && complete {
+				res.Exists = true
+				res.FilePath = ps.path
+			} else if checkErr == nil && !complete {
+				_ = os.Remove(ps.path)
+			}
+		}
+		// Also check the other extension (e.g. user has .flac, we look for .mp3 too)
+		if !res.Exists {
+			otherExt := ".mp3"
+			if fileExt == ".mp3" {
+				otherExt = ".flac"
+			}
+			altFilename := strings.TrimSuffix(expectedFilenameBase, ".flac") + otherExt
+			if ps, ok := fileMap[altFilename]; ok {
+				complete, checkErr := backend.HasCompleteMetadataAndCover(ps.path)
+				if checkErr == nil && complete {
+					res.Exists = true
+					res.FilePath = ps.path
+				} else if checkErr == nil && !complete {
+					_ = os.Remove(ps.path)
+				}
+			}
+		}
+		results[i] = res
+	}
 	return results
 }
 
@@ -1082,7 +1314,16 @@ type ScanSingleFileRequest struct {
 	FilePath string `json:"file_path"`
 }
 
-func (a *App) ScanSingleFileForQualityUpgrade(req ScanSingleFileRequest) (string, error) {
+func (a *App) ScanSingleFileForQualityUpgrade(req ScanSingleFileRequest) (result string, err error) {
+	// Recover from any panics to prevent app crash
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Printf("PANIC in ScanSingleFileForQualityUpgrade: %v\n", r)
+			result = ""
+			err = fmt.Errorf("scan crashed: %v", r)
+		}
+	}()
+
 	if req.FilePath == "" {
 		return "", fmt.Errorf("file path is required")
 	}
@@ -1144,6 +1385,57 @@ func (a *App) FindDuplicateTracks(folderPath string) (string, error) {
 	defer cancel()
 
 	duplicates, err := backend.FindDuplicateTracks(ctx, folderPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to find duplicates: %v", err)
+	}
+
+	jsonData, err := json.Marshal(duplicates)
+	if err != nil {
+		return "", fmt.Errorf("failed to encode response: %v", err)
+	}
+
+	return string(jsonData), nil
+}
+
+// FindDuplicateTracksWithOptions performs an advanced duplicate scan using JSON-encoded options.
+// optsJson should be a JSON object matching backend.DuplicateScanOptions fields, for example:
+// {"use_hash":true,"duration_tolerance_ms":2000,"use_filename_fallback":true,"ignore_duration":false,"use_fingerprint":false,"worker_count":0}
+func (a *App) FindDuplicateTracksWithOptions(folderPath string, optsJson string) (string, error) {
+	if folderPath == "" {
+		return "", fmt.Errorf("folder path is required")
+	}
+
+	// Parse options (best-effort). If parsing fails, return a clear error to the caller.
+	var opts backend.DuplicateScanOptions
+	if optsJson != "" {
+		if err := json.Unmarshal([]byte(optsJson), &opts); err != nil {
+			return "", fmt.Errorf("invalid options: %v", err)
+		}
+	} else {
+		// sensible defaults
+		opts = backend.DuplicateScanOptions{
+			UseHash:             true,
+			DurationToleranceMs: 2000,
+			UseFilenameFallback: true,
+			WorkerCount:         0,
+		}
+	}
+
+	// Adjust timeout when hashing or fingerprinting is requested (both can be slow for large libraries)
+	timeout := 2 * time.Minute
+	if opts.UseHash {
+		timeout = 10 * time.Minute
+	}
+	if opts.UseFingerprint {
+		if timeout < 15*time.Minute {
+			timeout = 15 * time.Minute
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	duplicates, err := backend.FindDuplicateTracksAdvanced(ctx, folderPath, opts)
 	if err != nil {
 		return "", fmt.Errorf("failed to find duplicates: %v", err)
 	}
@@ -1278,4 +1570,446 @@ func (a *App) OpenFileLocation(filePath string) error {
 
 	log.Printf("[OpenFileLocation] Command started successfully")
 	return nil
+}
+
+// DeleteFile deletes a file from the filesystem
+func (a *App) DeleteFile(filePath string) error {
+	if filePath == "" {
+		return fmt.Errorf("file path is required")
+	}
+
+	// Verify file exists
+	if _, err := os.Stat(filePath); os.IsNotExist(err) {
+		return fmt.Errorf("file does not exist: %s", filePath)
+	}
+
+	// Delete the file
+	if err := os.Remove(filePath); err != nil {
+		return fmt.Errorf("failed to delete file: %v", err)
+	}
+
+	// Invalidate cache entry for deleted file
+	if rootPath := filepath.Dir(filePath); rootPath != "" {
+		_ = backend.InvalidateCacheEntry(rootPath, filePath)
+	}
+
+	log.Printf("[DeleteFile] Successfully deleted: %s", filePath)
+	return nil
+}
+
+// DeleteFiles deletes multiple files from the filesystem
+func (a *App) DeleteFiles(filePaths []string) (map[string]string, error) {
+	if len(filePaths) == 0 {
+		return nil, fmt.Errorf("no file paths provided")
+	}
+
+	results := make(map[string]string)
+	deletedPaths := make([]string, 0)
+	rootPathMap := make(map[string][]string) // Group by root path for efficient cache invalidation
+
+	for _, filePath := range filePaths {
+		if filePath == "" {
+			continue
+		}
+
+		if _, err := os.Stat(filePath); os.IsNotExist(err) {
+			results[filePath] = "file does not exist"
+			continue
+		}
+
+		if err := os.Remove(filePath); err != nil {
+			results[filePath] = fmt.Sprintf("failed to delete: %v", err)
+		} else {
+			results[filePath] = "deleted"
+			deletedPaths = append(deletedPaths, filePath)
+			rootPath := filepath.Dir(filePath)
+			rootPathMap[rootPath] = append(rootPathMap[rootPath], filePath)
+			log.Printf("[DeleteFiles] Successfully deleted: %s", filePath)
+		}
+	}
+
+	// Invalidate cache entries for all deleted files (grouped by root path)
+	for rootPath, paths := range rootPathMap {
+		_ = backend.InvalidateCacheEntries(rootPath, paths)
+	}
+
+	return results, nil
+}
+
+// MoveFilesToQuarantine moves a list of files into a quarantine folder inside the given rootPath.
+// It returns a map of filePath -> status ("moved", "missing", "outside_root", or an error message)
+func (a *App) MoveFilesToQuarantine(filePaths []string, rootPath string) (map[string]string, error) {
+	if len(filePaths) == 0 {
+		return nil, fmt.Errorf("no file paths provided")
+	}
+	if rootPath == "" {
+		return nil, fmt.Errorf("root path is required")
+	}
+
+	quarantineDir := filepath.Join(rootPath, ".spotiflac_quarantine")
+	results := make(map[string]string)
+	movedPaths := make([]string, 0) // Track successfully moved files for cache invalidation
+
+	for _, filePath := range filePaths {
+		if filePath == "" {
+			continue
+		}
+		if _, err := os.Stat(filePath); os.IsNotExist(err) {
+			results[filePath] = "missing"
+			continue
+		}
+
+		// Ensure the file is inside the provided rootPath to avoid moving files outside the library
+		rel, err := filepath.Rel(rootPath, filePath)
+		if err != nil || strings.HasPrefix(rel, "..") {
+			results[filePath] = "outside_root"
+			continue
+		}
+
+		dest := filepath.Join(quarantineDir, rel)
+		if err := os.MkdirAll(filepath.Dir(dest), 0755); err != nil {
+			results[filePath] = fmt.Sprintf("mkdir failed: %v", err)
+			continue
+		}
+
+		// Try to rename first (fast and atomic on same filesystem). Fall back to copy+remove.
+		if err := os.Rename(filePath, dest); err != nil {
+			// fallback to copy then remove
+			data, rerr := os.ReadFile(filePath)
+			if rerr != nil {
+				results[filePath] = fmt.Sprintf("move failed: %v", rerr)
+				continue
+			}
+			if werr := os.WriteFile(dest, data, 0644); werr != nil {
+				results[filePath] = fmt.Sprintf("move failed: %v", werr)
+				continue
+			}
+			if rerr := os.Remove(filePath); rerr != nil {
+				results[filePath] = fmt.Sprintf("moved but failed to remove original: %v", rerr)
+				continue
+			}
+		}
+
+		results[filePath] = "moved"
+		movedPaths = append(movedPaths, filePath)
+		log.Printf("[MoveFilesToQuarantine] Moved %s -> %s", filePath, dest)
+	}
+
+	// Invalidate cache entries for moved files (they're now at new locations)
+	if len(movedPaths) > 0 {
+		_ = backend.InvalidateCacheEntries(rootPath, movedPaths)
+	}
+
+	return results, nil
+}
+
+// RestoreFilesFromQuarantine moves files from quarantine back to their original location under rootPath.
+// If the destination path already exists, a timestamped "restored" suffix is appended.
+func (a *App) RestoreFilesFromQuarantine(quarantinePaths []string, rootPath string) (map[string]string, error) {
+	if len(quarantinePaths) == 0 {
+		return nil, fmt.Errorf("no file paths provided")
+	}
+	if rootPath == "" {
+		return nil, fmt.Errorf("root path is required")
+	}
+
+	quarantineDir := filepath.Join(rootPath, ".spotiflac_quarantine")
+	results := make(map[string]string)
+
+	for _, qpath := range quarantinePaths {
+		if qpath == "" {
+			continue
+		}
+
+		rel, err := filepath.Rel(quarantineDir, qpath)
+		if err != nil || strings.HasPrefix(rel, "..") {
+			results[qpath] = "not_in_quarantine"
+			continue
+		}
+
+		dest := filepath.Join(rootPath, rel)
+		if err := os.MkdirAll(filepath.Dir(dest), 0755); err != nil {
+			results[qpath] = fmt.Sprintf("mkdir failed: %v", err)
+			continue
+		}
+
+		// If destination exists, pick a new name with a timestamp to avoid overwriting
+		if _, err := os.Stat(dest); err == nil {
+			ext := filepath.Ext(dest)
+			base := strings.TrimSuffix(dest, ext)
+			dest = fmt.Sprintf("%s.restored.%d%s", base, time.Now().Unix(), ext)
+		}
+
+		if err := os.Rename(qpath, dest); err != nil {
+			// fallback to copy+remove
+			data, rerr := os.ReadFile(qpath)
+			if rerr != nil {
+				results[qpath] = fmt.Sprintf("restore failed: %v", rerr)
+				continue
+			}
+			if werr := os.WriteFile(dest, data, 0644); werr != nil {
+				results[qpath] = fmt.Sprintf("restore failed: %v", werr)
+				continue
+			}
+			if rerr := os.Remove(qpath); rerr != nil {
+				results[qpath] = fmt.Sprintf("restored but failed to remove quarantine file: %v", rerr)
+				continue
+			}
+		}
+
+		results[qpath] = "restored"
+		log.Printf("[RestoreFilesFromQuarantine] Restored %s -> %s", qpath, dest)
+	}
+
+	return results, nil
+}
+
+// ListQuarantine lists all files currently in the quarantine for the given root path.
+func (a *App) ListQuarantine(rootPath string) ([]string, error) {
+	if rootPath == "" {
+		return nil, fmt.Errorf("root path is required")
+	}
+
+	quarantineDir := filepath.Join(rootPath, ".spotiflac_quarantine")
+	var files []string
+	err := filepath.Walk(quarantineDir, func(p string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil
+		}
+		if !info.IsDir() {
+			files = append(files, p)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to walk quarantine: %v", err)
+	}
+
+	return files, nil
+}
+
+/*
+EmptyQuarantine deletes all files in the quarantine and returns number of deleted items.
+This cleaned implementation ensures the function is properly closed and removes
+the duplicated / dangling code that was accidentally appended to the file end.
+*/
+func (a *App) EmptyQuarantine(rootPath string) (int, error) {
+	if rootPath == "" {
+		return 0, fmt.Errorf("root path is required")
+	}
+
+	quarantineDir := filepath.Join(rootPath, ".spotiflac_quarantine")
+	count := 0
+	err := filepath.Walk(quarantineDir, func(p string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil
+		}
+		if info.IsDir() {
+			return nil
+		}
+		if rmErr := os.Remove(p); rmErr == nil {
+			count++
+		}
+		return nil
+	})
+	if err != nil {
+		return count, fmt.Errorf("failed to empty quarantine: %v", err)
+	}
+
+	return count, nil
+}
+
+// FetchLyricsForFileRequest is the request type for fetching lyrics for an existing file
+type FetchLyricsForFileRequest struct {
+	FilePath     string `json:"file_path"`
+	SpotifyID    string `json:"spotify_id,omitempty"`
+	TrackName    string `json:"track_name,omitempty"`
+	ArtistName   string `json:"artist_name,omitempty"`
+	EmbedInFile  bool   `json:"embed_in_file"`
+	SaveAsLRC    bool   `json:"save_as_lrc"`
+	SkipIfExists bool   `json:"skip_if_exists"` // Skip fetching if lyrics already exist
+}
+
+// FetchLyricsForFile fetches lyrics for an existing audio file
+func (a *App) FetchLyricsForFile(req FetchLyricsForFileRequest) (string, error) {
+	if req.FilePath == "" {
+		return "", fmt.Errorf("file path is required")
+	}
+
+	client := backend.NewLyricsClient()
+	backendReq := backend.FetchLyricsForFileRequest{
+		FilePath:     req.FilePath,
+		SpotifyID:    req.SpotifyID,
+		TrackName:    req.TrackName,
+		ArtistName:   req.ArtistName,
+		EmbedInFile:  req.EmbedInFile,
+		SaveAsLRC:    req.SaveAsLRC,
+		SkipIfExists: req.SkipIfExists,
+	}
+
+	resp, err := client.FetchLyricsForFile(backendReq)
+	if err != nil {
+		return "", fmt.Errorf("failed to fetch lyrics: %v", err)
+	}
+
+	jsonData, err := json.Marshal(resp)
+	if err != nil {
+		return "", fmt.Errorf("failed to encode response: %v", err)
+	}
+
+	return string(jsonData), nil
+}
+
+// CheckDuplicateGroup validates if a set of files still contains duplicates
+// Returns the duplicate group if duplicates still exist, or null if resolved
+func (a *App) CheckDuplicateGroup(filePaths []string) (string, error) {
+	if len(filePaths) == 0 {
+		return "", fmt.Errorf("no file paths provided")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	group, err := backend.CheckDuplicateGroup(ctx, filePaths)
+	if err != nil {
+		return "", fmt.Errorf("failed to check duplicate group: %v", err)
+	}
+
+	if group == nil {
+		return "null", nil
+	}
+
+	jsonData, err := json.Marshal(group)
+	if err != nil {
+		return "", fmt.Errorf("failed to encode response: %v", err)
+	}
+
+	return string(jsonData), nil
+}
+
+// ============================================
+// Smart File Organization API
+// ============================================
+
+// OrganizePreviewRequest is the request type for previewing file organization
+type OrganizePreviewRequest struct {
+	SourcePath          string   `json:"source_path"`
+	FolderStructure     string   `json:"folder_structure"`
+	FileNameFormat      string   `json:"file_name_format"`
+	ConflictResolution  string   `json:"conflict_resolution"`
+	IncludeSubfolders   bool     `json:"include_subfolders"`
+	FilesFilter         []string `json:"files_filter"`
+	FileExtensionFilter string   `json:"file_extension_filter"`
+}
+
+// OrganizeExecuteRequest is the request type for executing file organization
+type OrganizeExecuteRequest struct {
+	SourcePath         string                        `json:"source_path"`
+	Items              []backend.OrganizePreviewItem `json:"items"`
+	CreateFolders      bool                          `json:"create_folders"`
+	MoveFiles          bool                          `json:"move_files"`
+	DeleteEmptyFolders bool                          `json:"delete_empty_folders"`
+	ConflictResolution string                        `json:"conflict_resolution"`
+}
+
+// GetFolderStructurePresets returns the available folder structure presets
+func (a *App) GetFolderStructurePresets() (string, error) {
+	presets := backend.GetFolderStructurePresets()
+	jsonData, err := json.Marshal(presets)
+	if err != nil {
+		return "", fmt.Errorf("failed to encode presets: %v", err)
+	}
+	return string(jsonData), nil
+}
+
+// PreviewOrganization generates a preview of how files would be organized
+func (a *App) PreviewOrganization(req OrganizePreviewRequest) (string, error) {
+	if req.SourcePath == "" {
+		return "", fmt.Errorf("source path is required")
+	}
+
+	backendReq := backend.OrganizePreviewRequest{
+		SourcePath:          req.SourcePath,
+		FolderStructure:     req.FolderStructure,
+		FileNameFormat:      req.FileNameFormat,
+		ConflictResolution:  req.ConflictResolution,
+		IncludeSubfolders:   req.IncludeSubfolders,
+		FilesFilter:         req.FilesFilter,
+		FileExtensionFilter: req.FileExtensionFilter,
+	}
+
+	response, err := backend.PreviewOrganization(backendReq)
+	if err != nil {
+		return "", fmt.Errorf("failed to preview organization: %v", err)
+	}
+
+	jsonData, err := json.Marshal(response)
+	if err != nil {
+		return "", fmt.Errorf("failed to encode response: %v", err)
+	}
+
+	return string(jsonData), nil
+}
+
+// ExecuteOrganization performs the actual file organization
+func (a *App) ExecuteOrganization(req OrganizeExecuteRequest) (string, error) {
+	if req.SourcePath == "" {
+		return "", fmt.Errorf("source path is required")
+	}
+
+	backendReq := backend.OrganizeExecuteRequest{
+		SourcePath:         req.SourcePath,
+		Items:              req.Items,
+		CreateFolders:      req.CreateFolders,
+		MoveFiles:          req.MoveFiles,
+		DeleteEmptyFolders: req.DeleteEmptyFolders,
+		ConflictResolution: req.ConflictResolution,
+	}
+
+	response, err := backend.ExecuteOrganization(backendReq)
+	if err != nil {
+		return "", fmt.Errorf("failed to execute organization: %v", err)
+	}
+
+	jsonData, err := json.Marshal(response)
+	if err != nil {
+		return "", fmt.Errorf("failed to encode response: %v", err)
+	}
+
+	return string(jsonData), nil
+}
+
+// AnalyzeOrganization provides statistics about how files are currently organized
+func (a *App) AnalyzeOrganization(rootPath string) (string, error) {
+	if rootPath == "" {
+		return "", fmt.Errorf("root path is required")
+	}
+
+	analysis, err := backend.AnalyzeOrganization(rootPath)
+	if err != nil {
+		return "", fmt.Errorf("failed to analyze organization: %v", err)
+	}
+
+	jsonData, err := json.Marshal(analysis)
+	if err != nil {
+		return "", fmt.Errorf("failed to encode response: %v", err)
+	}
+
+	return string(jsonData), nil
+}
+
+// ValidateOrganizationTemplate checks if a folder structure template is valid
+func (a *App) ValidateOrganizationTemplate(template string) (string, error) {
+	valid, message := backend.ValidateOrganizationTemplate(template)
+	result := map[string]interface{}{
+		"valid":   valid,
+		"message": message,
+	}
+
+	jsonData, err := json.Marshal(result)
+	if err != nil {
+		return "", fmt.Errorf("failed to encode response: %v", err)
+	}
+
+	return string(jsonData), nil
 }

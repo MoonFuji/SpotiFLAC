@@ -32,6 +32,8 @@ type SongLinkResponse struct {
 type DoubleDoubleSubmitResponse struct {
 	Success bool   `json:"success"`
 	ID      string `json:"id"`
+	Error   string `json:"error,omitempty"`
+	Message string `json:"message,omitempty"`
 }
 
 type DoubleDoubleStatusResponse struct {
@@ -199,26 +201,49 @@ func (a *AmazonDownloader) DownloadFromService(amazonURL, outputDir string) (str
 		fmt.Println("Submitting download request...")
 		resp, err := a.client.Do(req)
 		if err != nil {
-			lastError = fmt.Errorf("failed to submit request: %w", err)
+			// Prefer keeping a previous non-connection error (e.g. submit failed) over DNS/connection errors
+			errStr := err.Error()
+			isConnectionError := strings.Contains(errStr, "no such host") || strings.Contains(errStr, "connection refused") ||
+				strings.Contains(errStr, "i/o timeout") || strings.Contains(errStr, "connection reset")
+			if lastError == nil || !isConnectionError {
+				lastError = fmt.Errorf("failed to submit request: %w", err)
+			}
 			continue
 		}
 
 		if resp.StatusCode != 200 {
+			body, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
-			lastError = fmt.Errorf("submit failed with status %d", resp.StatusCode)
+			lastError = fmt.Errorf("submit failed with status %d: %s", resp.StatusCode, string(body))
+			continue
+		}
+
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			lastError = fmt.Errorf("failed to read submit response: %w", err)
 			continue
 		}
 
 		var submitResp DoubleDoubleSubmitResponse
-		if err := json.NewDecoder(resp.Body).Decode(&submitResp); err != nil {
-			resp.Body.Close()
-			lastError = fmt.Errorf("failed to decode submit response: %w", err)
+		if err := json.Unmarshal(body, &submitResp); err != nil {
+			lastError = fmt.Errorf("failed to decode submit response: %w (body: %s)", err, string(body))
 			continue
 		}
-		resp.Body.Close()
 
 		if !submitResp.Success || submitResp.ID == "" {
-			lastError = fmt.Errorf("submit request failed")
+			detail := submitResp.Error
+			if detail == "" {
+				detail = submitResp.Message
+			}
+			if detail == "" && len(body) > 0 && len(body) < 500 {
+				detail = string(body)
+			}
+			if detail != "" {
+				lastError = fmt.Errorf("submit request failed: %s", detail)
+			} else {
+				lastError = fmt.Errorf("submit request failed (success=%v, id=%q)", submitResp.Success, submitResp.ID)
+			}
 			continue
 		}
 

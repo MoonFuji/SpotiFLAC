@@ -6,8 +6,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 
 	id3v2 "github.com/bogem/id3v2/v2"
 	"github.com/go-flac/flacvorbis"
@@ -31,6 +33,12 @@ type AudioMetadata struct {
 	DiscNumber     int    `json:"disc_number"`
 	Year           string `json:"year"`
 	DurationMillis int    `json:"duration_millis"`
+	Bitrate        int    `json:"bitrate"`
+	SampleRate     int    `json:"sample_rate"`
+	BitDepth       int    `json:"bit_depth"`
+	Channels       int    `json:"channels"`
+	Codec          string `json:"codec"`
+	Lossless       bool   `json:"lossless"`
 }
 
 type RenamePreview struct {
@@ -95,7 +103,7 @@ func ListAudioFiles(dirPath string) ([]FileInfo, error) {
 		}
 
 		ext := strings.ToLower(filepath.Ext(path))
-		if ext == ".flac" || ext == ".mp3" || ext == ".m4a" {
+		if ext == ".flac" || ext == ".mp3" || ext == ".m4a" || ext == ".aac" || ext == ".ogg" || ext == ".wav" || ext == ".opus" {
 			result = append(result, FileInfo{
 				Name:  info.Name(),
 				Path:  path,
@@ -131,6 +139,8 @@ func ReadAudioMetadata(filePath string) (*AudioMetadata, error) {
 		metadata, err = readMp3Metadata(filePath)
 	case ".m4a":
 		metadata, err = readM4aMetadata(filePath)
+	case ".aac", ".ogg", ".wav", ".opus":
+		metadata, err = readMetadataWithFFprobe(filePath)
 	default:
 		return nil, fmt.Errorf("unsupported file format: %s", ext)
 	}
@@ -139,9 +149,53 @@ func ReadAudioMetadata(filePath string) (*AudioMetadata, error) {
 		return nil, err
 	}
 
-	// Get duration using ffprobe
-	duration, _ := getAudioDuration(filePath)
-	metadata.DurationMillis = duration
+	// Fill technical info via ffprobe only when base parser isn't ffprobe-backed
+	if ext == ".flac" || ext == ".mp3" {
+		if tech, err := readMetadataWithFFprobe(filePath); err == nil && tech != nil {
+			if metadata.Bitrate == 0 {
+				metadata.Bitrate = tech.Bitrate
+			}
+			if metadata.SampleRate == 0 {
+				metadata.SampleRate = tech.SampleRate
+			}
+			if metadata.BitDepth == 0 {
+				metadata.BitDepth = tech.BitDepth
+			}
+			if metadata.Channels == 0 {
+				metadata.Channels = tech.Channels
+			}
+			if metadata.Codec == "" {
+				metadata.Codec = tech.Codec
+			}
+			if !metadata.Lossless {
+				metadata.Lossless = tech.Lossless
+			}
+			if metadata.Title == "" {
+				metadata.Title = tech.Title
+			}
+			if metadata.Artist == "" {
+				metadata.Artist = tech.Artist
+			}
+			if metadata.Album == "" {
+				metadata.Album = tech.Album
+			}
+			if metadata.AlbumArtist == "" {
+				metadata.AlbumArtist = tech.AlbumArtist
+			}
+			if metadata.TrackNumber == 0 {
+				metadata.TrackNumber = tech.TrackNumber
+			}
+			if metadata.DiscNumber == 0 {
+				metadata.DiscNumber = tech.DiscNumber
+			}
+			if metadata.Year == "" {
+				metadata.Year = tech.Year
+			}
+			if metadata.DurationMillis == 0 && tech.DurationMillis > 0 {
+				metadata.DurationMillis = tech.DurationMillis
+			}
+		}
+	}
 
 	return metadata, nil
 }
@@ -265,10 +319,17 @@ func readMetadataWithFFprobe(filePath string) (*AudioMetadata, error) {
 
 	var result struct {
 		Format struct {
-			Tags map[string]string `json:"tags"`
+			Tags     map[string]string `json:"tags"`
+			Duration string            `json:"duration"`
 		} `json:"format"`
 		Streams []struct {
-			Tags map[string]string `json:"tags"`
+			CodecType     string            `json:"codec_type"`
+			CodecName     string            `json:"codec_name"`
+			BitRate       string            `json:"bit_rate"`
+			SampleRate    string            `json:"sample_rate"`
+			BitsPerSample int               `json:"bits_per_sample"`
+			Channels      int               `json:"channels"`
+			Tags          map[string]string `json:"tags"`
 		} `json:"streams"`
 	}
 
@@ -281,6 +342,31 @@ func readMetadataWithFFprobe(filePath string) (*AudioMetadata, error) {
 	allTags := make(map[string]string)
 
 	for _, stream := range result.Streams {
+		if stream.CodecType == "audio" {
+			metadata.Codec = stream.CodecName
+			if stream.BitRate != "" {
+				if br, err := strconv.Atoi(stream.BitRate); err == nil {
+					metadata.Bitrate = br
+				}
+			}
+			if stream.SampleRate != "" {
+				if sr, err := strconv.Atoi(stream.SampleRate); err == nil {
+					metadata.SampleRate = sr
+				}
+			}
+			if stream.BitsPerSample > 0 {
+				metadata.BitDepth = stream.BitsPerSample
+			}
+			if stream.Channels > 0 {
+				metadata.Channels = stream.Channels
+			}
+			if strings.Contains(strings.ToLower(stream.CodecName), "flac") ||
+				strings.Contains(strings.ToLower(stream.CodecName), "alac") ||
+				strings.Contains(strings.ToLower(stream.CodecName), "pcm") {
+				metadata.Lossless = true
+			}
+		}
+
 		for key, value := range stream.Tags {
 			allTags[strings.ToLower(key)] = value
 		}
@@ -288,6 +374,12 @@ func readMetadataWithFFprobe(filePath string) (*AudioMetadata, error) {
 
 	for key, value := range result.Format.Tags {
 		allTags[strings.ToLower(key)] = value
+	}
+
+	if result.Format.Duration != "" {
+		if dur, err := strconv.ParseFloat(result.Format.Duration, 64); err == nil {
+			metadata.DurationMillis = int(dur * 1000)
+		}
 	}
 
 	for key, value := range allTags {
@@ -350,6 +442,51 @@ func getAudioDuration(filePath string) (int, error) {
 	return int(durationSec * 1000), nil
 }
 
+// hasEmbeddedCover returns true if the audio file has embedded cover art (FLAC picture block or ID3v2 APIC).
+func hasEmbeddedCover(filePath string) (bool, error) {
+	ext := strings.ToLower(filepath.Ext(filePath))
+	switch ext {
+	case ".flac":
+		f, err := flac.ParseFile(filePath)
+		if err != nil {
+			return false, err
+		}
+		for _, block := range f.Meta {
+			if block.Type == flac.Picture {
+				return true, nil
+			}
+		}
+		return false, nil
+	case ".mp3":
+		tag, err := id3v2.Open(filePath, id3v2.Options{Parse: true})
+		if err != nil {
+			return false, err
+		}
+		defer tag.Close()
+		pictures := tag.GetFrames(tag.CommonID("Attached picture"))
+		return len(pictures) > 0, nil
+	default:
+		return false, nil
+	}
+}
+
+// HasCompleteMetadataAndCover returns true if the file has non-empty title and artist and embedded cover art.
+// Used to treat incomplete/partial downloads (e.g. after a crash) as missing so they get re-downloaded.
+func HasCompleteMetadataAndCover(filePath string) (bool, error) {
+	ext := strings.ToLower(filepath.Ext(filePath))
+	if ext != ".flac" && ext != ".mp3" {
+		return false, nil
+	}
+	meta, err := ReadAudioMetadata(filePath)
+	if err != nil || meta == nil {
+		return false, err
+	}
+	if strings.TrimSpace(meta.Title) == "" || strings.TrimSpace(meta.Artist) == "" {
+		return false, nil
+	}
+	return hasEmbeddedCover(filePath)
+}
+
 func readM4aMetadata(filePath string) (*AudioMetadata, error) {
 	metadata, err := readMetadataWithFFprobe(filePath)
 	if err != nil {
@@ -410,40 +547,70 @@ func sanitizeFilenameForRename(name string) string {
 	return strings.TrimSpace(result)
 }
 
+// renamePreviewWorkerConcurrency limits parallel metadata reads during preview
+const renamePreviewWorkerConcurrency = 8
+
 func PreviewRename(files []string, format string) []RenamePreview {
-	var previews []RenamePreview
-
-	for _, filePath := range files {
-		preview := RenamePreview{
-			OldPath: filePath,
-			OldName: filepath.Base(filePath),
-		}
-
-		metadata, err := ReadAudioMetadata(filePath)
-		if err != nil {
-			preview.Error = err.Error()
-			previews = append(previews, preview)
-			continue
-		}
-
-		preview.Metadata = *metadata
-
-		ext := filepath.Ext(filePath)
-		newName := GenerateFilename(metadata, format, ext)
-
-		if newName == "" {
-			preview.Error = "Could not generate filename (missing metadata)"
-			previews = append(previews, preview)
-			continue
-		}
-
-		preview.NewName = newName
-		preview.NewPath = filepath.Join(filepath.Dir(filePath), newName)
-
-		previews = append(previews, preview)
+	if len(files) == 0 {
+		return nil
 	}
+	n := runtime.NumCPU()
+	if n > renamePreviewWorkerConcurrency {
+		n = renamePreviewWorkerConcurrency
+	}
+	if n < 2 {
+		n = 2
+	}
+	results := make([]RenamePreview, len(files))
+	sem := make(chan struct{}, n)
+	var wg sync.WaitGroup
+	for i, filePath := range files {
+		wg.Add(1)
+		go func(idx int, path string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			preview := RenamePreview{
+				OldPath: path,
+				OldName: filepath.Base(path),
+			}
+			metadata, err := ReadAudioMetadata(path)
+			if err != nil {
+				preview.Error = err.Error()
+				results[idx] = preview
+				return
+			}
+			preview.Metadata = *metadata
+			ext := filepath.Ext(path)
+			newName := GenerateFilename(metadata, format, ext)
+			if newName == "" {
+				preview.Error = "Could not generate filename (missing metadata)"
+				results[idx] = preview
+				return
+			}
+			preview.NewName = newName
+			preview.NewPath = filepath.Join(filepath.Dir(path), newName)
+			results[idx] = preview
+		}(i, filePath)
+	}
+	wg.Wait()
+	return results
+}
 
-	return previews
+// PreviewRenameMismatched returns a preview only for files whose current filename
+// does not match the given format (i.e. they would be renamed). Use to select "files that need renaming".
+func PreviewRenameMismatched(files []string, format string) []RenamePreview {
+	all := PreviewRename(files, format)
+	out := make([]RenamePreview, 0, len(all))
+	for _, p := range all {
+		if p.Error != "" {
+			continue // skip errors; only include renamable items
+		}
+		if p.OldName != p.NewName {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func GetFileSizes(files []string) map[string]int64 {
@@ -455,6 +622,50 @@ func GetFileSizes(files []string) map[string]int64 {
 		}
 	}
 	return result
+}
+
+// RenameFilesFromPreview performs renames using existing preview data (no metadata read).
+// Skips items with Error set or where NewPath == OldPath. Use after PreviewRename for an efficient apply step.
+func RenameFilesFromPreview(previews []RenamePreview) []RenameResult {
+	results := make([]RenameResult, 0, len(previews))
+	usedDest := make(map[string]string) // destination -> source, for conflict detection within batch
+
+	for _, p := range previews {
+		result := RenameResult{OldPath: p.OldPath, NewPath: p.NewPath}
+		if p.Error != "" {
+			result.Success = false
+			result.Error = p.Error
+			results = append(results, result)
+			continue
+		}
+		if p.NewPath == p.OldPath {
+			result.Success = true
+			results = append(results, result)
+			continue
+		}
+		if other, exists := usedDest[p.NewPath]; exists {
+			result.Success = false
+			result.Error = fmt.Sprintf("conflict with %s", other)
+			results = append(results, result)
+			continue
+		}
+		if _, err := os.Stat(p.NewPath); err == nil {
+			result.Success = false
+			result.Error = "File already exists"
+			results = append(results, result)
+			continue
+		}
+		if err := os.Rename(p.OldPath, p.NewPath); err != nil {
+			result.Success = false
+			result.Error = err.Error()
+			results = append(results, result)
+			continue
+		}
+		usedDest[p.NewPath] = p.OldPath
+		result.Success = true
+		results = append(results, result)
+	}
+	return results
 }
 
 func RenameFiles(files []string, format string) []RenameResult {
