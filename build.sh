@@ -23,9 +23,6 @@ fi
 # Navigate to project root
 cd "$(dirname "$0")"
 
-echo "📝 Generating bindings..."
-$WAILS_CMD generate module
-
 echo "📦 Installing frontend dependencies..."
 cd frontend
 pnpm install
@@ -33,8 +30,11 @@ pnpm install
 echo "🏗️  Building frontend..."
 pnpm run build
 
-echo "🔨 Building application..."
+echo "📝 Generating bindings..."
 cd ..
+$WAILS_CMD generate module
+
+echo "🔨 Building application..."
 $WAILS_CMD build -platform linux/amd64
 
 echo "✅ Build complete! Executable: build/bin/SpotiFLAC"
