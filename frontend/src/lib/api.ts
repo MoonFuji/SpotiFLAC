@@ -1,6 +1,8 @@
 import type { SpotifyMetadataResponse, DownloadRequest, DownloadResponse, HealthResponse, LyricsDownloadRequest, LyricsDownloadResponse, CoverDownloadRequest, CoverDownloadResponse, HeaderDownloadRequest, HeaderDownloadResponse, GalleryImageDownloadRequest, GalleryImageDownloadResponse, AvatarDownloadRequest, AvatarDownloadResponse, } from "@/types/api";
 import { GetSpotifyMetadata, DownloadTrack, DownloadLyrics, DownloadCover, DownloadHeader, DownloadGalleryImage, DownloadAvatar } from "../../wailsjs/go/main/App";
 import { main } from "../../wailsjs/go/models";
+import { withRetry } from "@/lib/download-helpers";
+
 export async function fetchSpotifyMetadata(url: string, batch: boolean = true, delay: number = 1.0, timeout: number = 300.0): Promise<SpotifyMetadataResponse> {
     const req = new main.SpotifyMetadataRequest({
         url,
@@ -14,6 +16,11 @@ export async function fetchSpotifyMetadata(url: string, batch: boolean = true, d
 export async function downloadTrack(request: DownloadRequest): Promise<DownloadResponse> {
     const req = new main.DownloadRequest(request);
     return await DownloadTrack(req);
+}
+
+/** Same as downloadTrack but with retries (3 attempts, exponential backoff) for transient failures. */
+export async function downloadTrackWithRetry(request: DownloadRequest): Promise<DownloadResponse> {
+    return withRetry(() => downloadTrack(request), { maxAttempts: 3 });
 }
 export async function checkHealth(): Promise<HealthResponse> {
     return {
