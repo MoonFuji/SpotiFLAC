@@ -4,6 +4,7 @@ build/
 *.dll
 *.dylib
 *.so
+spotiflac
 
 # Wails Generated Files
 frontend/wailsjs/
